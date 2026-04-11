@@ -35,15 +35,25 @@
 namespace fs = std::filesystem;
 
 static const char* BANNER =
+    "\n"
+    "Claudius                 v0.1.4\n"
     "\033[38;5;208m"
-    "   _____ _                 _ _\n"
-    "  / ____| |               | (_)\n"
-    " | |    | | __ _ _   _  __| |_ _   _ ___\n"
-    " | |    | |/ _` | | | |/ _` | | | | / __|\n"
-    " | |____| | (_| | |_| | (_| | | |_| \\__ \\\n"
-    "  \\_____|_|\\__,_|\\__,_|\\__,_|_|\\__,_|___/\n"
-    "                                    v0.1.4\n"
-    "\033[0m";
+    "\n"
+    "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc\n"
+    " cccbbbccccccccccccccccccccccc \n"
+    "   cbbbbbbbbbbbbbbbbbcccc      \n"
+    "     cbbbccccccccccc           \n"
+    "     cbbbbbbbbbbbbbbbbccc      \n"
+    "     cbbbccbbbccbbbbccbbb      \n"
+    "     cbbc  bbb  bbb  cbbb      \n"
+    "     cbbc  bbb  bbb  cbbb      \n"
+    "     cbbc  bbb  bbb  cbbb      \n"
+    "      cbc  bbb  bbb  cbc       \n"
+    "            cc  cc             \n"
+    "\033[0m"
+    "\n"
+    "   nemo omnibus horis sapit    \n"
+    "\n";
 
 static std::string agent_color(const std::string& agent_id) {
     if (agent_id == "claudius") return "\033[38;5;208m";  // orange
@@ -637,12 +647,15 @@ static void cmd_interactive() {
     orch.load_agents(dir + "/agents");
 
     std::cout << BANNER;
-    std::cout << "Agents: ";
-    for (auto& id : orch.list_agents()) std::cout << id << " ";
+    std::cout << "Basic Commands: /send <agent> <msg>\n";
+    std::cout << "                /ask  <query>\n";
+    std::cout << "                /use  <agent>\n";
+    std::cout << "                /list\n";
+    std::cout << "                /status\n";
+    std::cout << "                /tokens\n";
+    std::cout << "                /help\n";
+    std::cout << "                /quit\n";
     std::cout << "\n";
-    std::cout << "Commands: /send <agent> <msg> | /ask <query> | /list | /status\n";
-    std::cout << "          /create <id> | /remove <id> | /reset <id> | /tokens | /quit\n";
-    std::cout << "Default: messages go to claudius master.\n\n";
 
     std::string current_agent = "claudius";
     ThinkingIndicator thinking;
