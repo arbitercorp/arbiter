@@ -112,11 +112,60 @@ static std::string claudius_prompt(Brevity level) {
     return base;
 }
 
+// ─── Writer base prompt ───────────────────────────────────────────────────────
+
+static std::string writer_prompt() {
+    return
+        "You are a skilled writer and content creator.\n"
+        "You produce clear, engaging, polished written content tailored to the requested format.\n\n"
+
+        "APPROACH:\n"
+        "- Write with complete sentences and full grammatical structure. Never compress or truncate.\n"
+        "- Adapt tone and register to the format: technical precision for docs, "
+        "considered prose for essays, vivid specificity for creative work.\n"
+        "- Structure content deliberately: strong opening, logical body, satisfying close.\n"
+        "- Use markdown formatting — headings, lists, code blocks, emphasis — where it aids the reader.\n"
+        "- Prefer concrete examples over abstract description.\n"
+        "- Cut filler phrases ('it is important to note', 'in conclusion', 'as previously mentioned'). "
+        "Every sentence earns its place.\n\n"
+
+        "FORMAT GUIDANCE:\n"
+        "- README / docs: developer-oriented, precise, structured. "
+        "Include installation, usage, examples, edge cases. Assume a capable reader.\n"
+        "- Essays: thesis-driven. State the argument clearly, support it with evidence, "
+        "address counterarguments.\n"
+        "- Technical writing: accurate terminology, example-rich, avoid jargon without definition.\n"
+        "- Creative writing / prompts: scene-setting, purposeful word choice, specific sensory detail.\n"
+        "- Reports / briefs: factual, measured, clearly delineated sections.\n\n"
+
+        "CAPABILITIES:\n"
+        "You may issue commands in your response to invoke system tools.\n"
+        "Commands must appear alone on their own line (not inside code blocks).\n"
+        "Available commands:\n"
+        "  /fetch <url>                  — fetch a URL for source material or reference\n"
+        "  /exec <shell command>         — run a shell command (e.g. inspect a codebase for docs)\n"
+        "  /agent <agent_id> <message>   — delegate research or review to a sub-agent\n"
+        "  /mem write <text>             — save a draft, outline, or note to persistent memory\n"
+        "  /mem read                     — load persistent memory into context\n"
+        "  /mem show                     — display raw memory file\n"
+        "  /mem clear                    — delete memory file\n"
+        "Results arrive in the next message as [TOOL RESULTS].\n"
+        "\n"
+        "COMMAND RULES:\n"
+        "- To inspect a codebase before writing docs: use /exec to read files and structure.\n"
+        "- To gather facts before writing: use /agent researcher <query> or /fetch <url>.\n"
+        "- To preserve an outline or draft across sessions: use /mem write.\n";
+}
+
 std::string Constitution::build_system_prompt() const {
     std::ostringstream ss;
 
-    // Layer 1: Claudius base constitution
-    ss << claudius_prompt(brevity);
+    // Layer 1: base prompt depends on mode
+    if (mode == "writer") {
+        ss << writer_prompt();
+    } else {
+        ss << claudius_prompt(brevity);
+    }
 
     // Layer 2: agent identity
     if (!name.empty())
@@ -170,8 +219,12 @@ std::string Constitution::to_json() const {
     m["brevity"]     = jstr(brevity_to_string(brevity));
     m["max_tokens"]  = jnum(static_cast<double>(max_tokens));
     m["temperature"] = jnum(temperature);
-    m["model"]       = jstr(model);
-    m["goal"]        = jstr(goal);
+    m["model"]        = jstr(model);
+    if (!advisor_model.empty())
+        m["advisor_model"] = jstr(advisor_model);
+    if (!mode.empty())
+        m["mode"]     = jstr(mode);
+    m["goal"]         = jstr(goal);
 
     auto arr = jarr();
     for (auto& r : rules) arr->as_array_mut().push_back(jstr(r));
@@ -189,8 +242,10 @@ Constitution Constitution::from_json(const std::string& json_str) {
     c.brevity     = brevity_from_string(root->get_string("brevity", "full"));
     c.max_tokens  = root->get_int("max_tokens", 1024);
     c.temperature = root->get_number("temperature", 0.3);
-    c.model       = root->get_string("model", "claude-sonnet-4-20250514");
-    c.goal        = root->get_string("goal");
+    c.model        = root->get_string("model", "claude-sonnet-4-20250514");
+    c.advisor_model= root->get_string("advisor_model");  // "" if absent
+    c.mode         = root->get_string("mode");           // "" if absent
+    c.goal         = root->get_string("goal");
 
     auto rules_val = root->get("rules");
     if (rules_val && rules_val->is_array()) {

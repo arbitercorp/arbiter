@@ -23,11 +23,12 @@ ApiResponse Agent::send(const std::string& user_message) {
 
     // Build request
     ApiRequest req;
-    req.model = config_.model;
+    req.model         = config_.model;
     req.system_prompt = config_.build_system_prompt();
-    req.max_tokens = config_.max_tokens;
-    req.temperature = config_.temperature;
-    req.messages = history_;
+    req.max_tokens    = config_.max_tokens;
+    req.temperature   = config_.temperature;
+    req.messages      = history_;
+    req.advisor_model = config_.advisor_model;
 
     auto resp = client_.complete(req);
 
@@ -69,6 +70,7 @@ ApiResponse Agent::stream(const std::string& user_message, StreamCallback cb) {
     req.max_tokens    = config_.max_tokens;
     req.temperature   = config_.temperature;
     req.messages      = history_;
+    req.advisor_model = config_.advisor_model;
 
     auto resp = client_.stream(req, cb);
 
@@ -118,6 +120,8 @@ std::string Agent::status_summary() const {
        << " | in:" << stats_.total_input_tokens
        << " out:" << stats_.total_output_tokens
        << " | reqs:" << stats_.total_requests;
+    if (!config_.advisor_model.empty())
+        ss << " | advisor:" << config_.advisor_model;
     return ss.str();
 }
 

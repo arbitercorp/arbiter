@@ -25,6 +25,8 @@ struct ApiRequest {
     std::vector<Message> messages;
     int max_tokens = 1024;
     double temperature = 0.3;
+    // Advisor tool: if non-empty, include advisor_20260301 tool and beta header.
+    std::string advisor_model;
 };
 
 struct ApiResponse {
@@ -77,7 +79,7 @@ private:
 
     bool ensure_connection();
     void close_connection();
-    std::string send_request(const std::string& body, bool streaming);
+    std::string send_request(const std::string& body, bool streaming, bool advisor = false);
     std::string read_response(bool streaming, StreamCallback cb);
     ApiResponse read_streaming_response(StreamCallback cb);
 

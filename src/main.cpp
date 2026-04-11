@@ -39,7 +39,7 @@ namespace fs = std::filesystem;
 
 static const char* BANNER =
     "\n"
-    "Claudius                 v0.1.6\n"
+    "Claudius                 v0.1.7\n"
     "\033[38;5;208m"
     "\n"
     "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc\n"
@@ -166,11 +166,13 @@ static void cmd_init() {
     }
     {
         claudius::Constitution c;
-        c.name = "researcher";
-        c.role = "research-analyst";
-        c.brevity = claudius::Brevity::Lite;
-        c.max_tokens = 2048;
-        c.temperature = 0.5;
+        c.name         = "researcher";
+        c.role         = "research-analyst";
+        c.brevity      = claudius::Brevity::Lite;
+        c.model        = "claude-haiku-4-5-20251001";   // fast executor
+        c.advisor_model= "claude-opus-4-6";             // Opus advises on strategy
+        c.max_tokens   = 2048;
+        c.temperature  = 0.5;
         c.goal = "Research topics with depth. Synthesize findings. Distinguish fact from inference.";
         c.personality = "Meticulous, skeptical of hearsay, prefers primary sources. "
                         "Reports with the formality of a written brief.";
@@ -178,6 +180,7 @@ static void cmd_init() {
             "Note confidence: high, medium, or low.",
             "Separate what is known from what is inferred.",
             "When uncertain, state it plainly.",
+            "Prefer primary sources. Verify claims with /fetch before stating them as fact.",
         };
         c.save(agents_dir + "/researcher.json");
     }
@@ -199,11 +202,35 @@ static void cmd_init() {
         };
         c.save(agents_dir + "/devops.json");
     }
+    {
+        claudius::Constitution c;
+        c.name        = "writer";
+        c.role        = "content-writer";
+        c.mode        = "writer";
+        c.model       = "claude-sonnet-4-6";
+        c.max_tokens  = 8192;
+        c.temperature = 0.7;
+        c.goal = "Produce polished, well-structured written content. "
+                 "Essays, documentation, READMEs, reports, creative writing — "
+                 "adapt format and tone to the task.";
+        c.personality = "Thoughtful, precise, adapts register to the work. "
+                        "Prefers showing over telling. Edits ruthlessly.";
+        c.rules = {
+            "Read the codebase or reference material before writing docs — use /exec or /fetch.",
+            "For essays: state the thesis in the opening paragraph.",
+            "For READMEs: lead with what the project does, then how to use it.",
+            "For creative writing: anchor abstract ideas in concrete, sensory detail.",
+            "Never pad with filler phrases. Every sentence must earn its place.",
+            "Offer a revision or alternative framing if the first draft may not land.",
+        };
+        c.save(agents_dir + "/writer.json");
+    }
 
     std::cout << "Example agents created in " << agents_dir << "/\n";
     std::cout << "  reviewer.json   — code review (ultra)\n";
-    std::cout << "  researcher.json — research analyst (lite)\n";
-    std::cout << "  devops.json     — infrastructure (full)\n\n";
+    std::cout << "  researcher.json — research analyst (haiku + opus advisor)\n";
+    std::cout << "  devops.json     — infrastructure (full)\n";
+    std::cout << "  writer.json     — essays, docs, READMEs, creative writing\n\n";
     std::cout << "Edit these or add your own. Then run: claudius\n";
 }
 

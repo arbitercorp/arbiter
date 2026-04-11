@@ -128,17 +128,31 @@ std::string ApiClient::build_request_body(const ApiRequest& req, bool streaming)
         m["stream"] = jbool(true);
     }
 
+    // Advisor tool (beta: advisor-tool-2026-03-01)
+    if (!req.advisor_model.empty()) {
+        auto tool = jobj();
+        tool->as_object_mut()["type"]  = jstr("advisor_20260301");
+        tool->as_object_mut()["name"]  = jstr("advisor");
+        tool->as_object_mut()["model"] = jstr(req.advisor_model);
+        auto tools_arr = jarr();
+        tools_arr->as_array_mut().push_back(tool);
+        m["tools"] = tools_arr;
+    }
+
     return json_serialize(*obj);
 }
 
-std::string ApiClient::send_request(const std::string& body, bool streaming) {
+std::string ApiClient::send_request(const std::string& body, bool streaming, bool advisor) {
     std::ostringstream http;
     http << "POST " << API_PATH << " HTTP/1.1\r\n";
     http << "Host: " << API_HOST << "\r\n";
     http << "Content-Type: application/json\r\n";
     http << "x-api-key: " << api_key_ << "\r\n";
     http << "anthropic-version: " << API_VERSION << "\r\n";
-    http << "anthropic-beta: prompt-caching-2024-07-31\r\n";
+    // Combine all beta features into a single header
+    std::string beta = "prompt-caching-2024-07-31";
+    if (advisor) beta += ", advisor-tool-2026-03-01";
+    http << "anthropic-beta: " << beta << "\r\n";
     http << "Content-Length: " << body.size() << "\r\n";
     if (streaming) http << "Accept: text/event-stream\r\n";
     http << "Connection: keep-alive\r\n";
@@ -316,7 +330,7 @@ ApiResponse ApiClient::complete(const ApiRequest& req) {
                     return r;
                 }
                 std::string body = build_request_body(req, false);
-                send_request(body, false);
+                send_request(body, false, !req.advisor_model.empty());
                 std::string raw = read_response(false, nullptr);
                 resp = parse_response(raw);
             } catch (...) {
@@ -492,7 +506,7 @@ ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
             ApiResponse r; r.ok = false; r.error = "Connection failed"; return r;
         }
         std::string body = build_request_body(req, true);
-        send_request(body, true);
+        send_request(body, true, !req.advisor_model.empty());
         ApiResponse resp = read_streaming_response(cb);
         if (resp.ok) {
             total_in_  += resp.input_tokens;

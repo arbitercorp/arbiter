@@ -23,6 +23,17 @@ struct Constitution {
     double  temperature = 0.3;      // low = deterministic
     std::string model = "claude-sonnet-4-20250514";
 
+    // Agent mode — selects the base system prompt.
+    // ""/"standard": compressed Claudius voice (default for all agents)
+    // "writer": full-prose mode — disables compression, enables writing guidance
+    std::string mode;
+
+    // Optional advisor model (beta: advisor-tool-2026-03-01).
+    // When set, the executor model can consult this higher-intelligence model
+    // mid-generation for strategic planning. Must be >= capability of executor.
+    // Example: model="claude-haiku-4-5-20251001", advisor_model="claude-opus-4-6"
+    std::string advisor_model;  // "" = disabled
+
     // --- System prompt pieces ---
     std::string goal;               // what this agent is trying to accomplish
     std::vector<std::string> rules; // explicit behavioral constraints
