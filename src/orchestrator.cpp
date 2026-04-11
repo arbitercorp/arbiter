@@ -100,6 +100,7 @@ ApiResponse Orchestrator::send(const std::string& agent_id, const std::string& m
         auto cmds = parse_agent_commands(resp.content);
         if (cmds.empty()) break;
 
+        resp.had_tool_calls = true;
         current_msg = execute_agent_commands(cmds, agent_id, memory_dir_);
     }
 

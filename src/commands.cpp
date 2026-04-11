@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <sstream>
@@ -53,6 +54,99 @@ std::vector<AgentCommand> parse_agent_commands(const std::string& response) {
 }
 
 // ---------------------------------------------------------------------------
+// html_to_text — strip tags and boilerplate, return readable text
+// ---------------------------------------------------------------------------
+
+static std::string html_to_text(const std::string& html) {
+    std::string out;
+    out.reserve(html.size() / 4);
+
+    size_t i = 0;
+    const size_t n = html.size();
+
+    // Skip script/style blocks wholesale
+    auto skip_block = [&](const char* close_tag) {
+        size_t pos = html.find(close_tag, i);
+        i = (pos == std::string::npos) ? n : pos + std::strlen(close_tag);
+    };
+
+    bool last_was_space = true;
+
+    while (i < n) {
+        if (html[i] == '<') {
+            // Peek at the tag name
+            size_t j = i + 1;
+            while (j < n && html[j] == ' ') ++j;
+            // Check for block-level tags we want to map to newlines
+            auto tag_is = [&](const char* t) {
+                size_t tl = std::strlen(t);
+                return n - j >= tl &&
+                       ::strncasecmp(html.c_str() + j, t, tl) == 0 &&
+                       (j + tl >= n || html[j + tl] == '>' || html[j + tl] == ' ');
+            };
+            if (tag_is("script") || tag_is("style") || tag_is("noscript")) {
+                // Find the matching close tag
+                size_t close = html.find('>', i);
+                if (close != std::string::npos) i = close + 1;
+                // Now skip until </script>, </style>, </noscript>
+                if (tag_is("script"))   { skip_block("</script>");   continue; }
+                if (tag_is("style"))    { skip_block("</style>");    continue; }
+                if (tag_is("noscript")) { skip_block("</noscript>"); continue; }
+            }
+            bool block = tag_is("p")  || tag_is("/p")  ||
+                         tag_is("br") || tag_is("li")  ||
+                         tag_is("h1") || tag_is("h2")  || tag_is("h3") ||
+                         tag_is("h4") || tag_is("h5")  || tag_is("h6") ||
+                         tag_is("div") || tag_is("/div") ||
+                         tag_is("tr") || tag_is("td")  || tag_is("th");
+            // Skip to end of tag
+            while (i < n && html[i] != '>') ++i;
+            if (i < n) ++i;
+            if (block && !out.empty() && out.back() != '\n') {
+                out += '\n';
+                last_was_space = true;
+            }
+        } else if (html[i] == '&') {
+            // Basic HTML entity decoding
+            if (n - i >= 4 && html.substr(i, 4) == "&lt;")       { out += '<'; i += 4; }
+            else if (n - i >= 4 && html.substr(i, 4) == "&gt;")  { out += '>'; i += 4; }
+            else if (n - i >= 5 && html.substr(i, 5) == "&amp;") { out += '&'; i += 5; }
+            else if (n - i >= 6 && html.substr(i, 6) == "&nbsp;"){ out += ' '; i += 6; last_was_space = true; }
+            else { out += html[i++]; last_was_space = false; }
+        } else {
+            char c = html[i++];
+            if (c == '\r') continue;
+            bool is_ws = (c == ' ' || c == '\t' || c == '\n');
+            if (is_ws) {
+                if (!last_was_space && !out.empty()) {
+                    out += (c == '\n') ? '\n' : ' ';
+                    last_was_space = true;
+                }
+            } else {
+                out += c;
+                last_was_space = false;
+            }
+        }
+    }
+
+    // Collapse runs of blank lines to a single blank line
+    std::string compressed;
+    compressed.reserve(out.size());
+    int consecutive_newlines = 0;
+    for (char c : out) {
+        if (c == '\n') {
+            ++consecutive_newlines;
+            if (consecutive_newlines <= 2) compressed += c;
+        } else {
+            consecutive_newlines = 0;
+            compressed += c;
+        }
+    }
+
+    return compressed;
+}
+
+// ---------------------------------------------------------------------------
 // cmd_fetch
 // ---------------------------------------------------------------------------
 
@@ -74,14 +168,17 @@ std::string cmd_fetch(const std::string& url) {
     FILE* pipe = popen(cmd.c_str(), "r");
     if (!pipe) return "ERR: failed to run curl";
 
-    std::string result;
-    result.reserve(65536);
+    std::string raw;
+    raw.reserve(65536);
     char buf[4096];
     while (fgets(buf, sizeof(buf), pipe)) {
-        result += buf;
-        if (result.size() > 512 * 1024) break;
+        raw += buf;
+        if (raw.size() > 512 * 1024) break;
     }
     pclose(pipe);
+
+    // Strip HTML tags and boilerplate to save tokens
+    std::string result = html_to_text(raw);
     return result;
 }
 
@@ -126,10 +223,35 @@ std::string execute_agent_commands(const std::vector<AgentCommand>& cmds,
     std::ostringstream out;
     out << "[TOOL RESULTS]\n";
 
+    // Caps: 16 KB per fetch (stripped text), max 3 fetches per turn,
+    // and a total tool-result budget of 32 KB.
+    static constexpr size_t kPerFetchLimit  = 16384;
+    static constexpr size_t kTotalLimit     = 32768;
+    static constexpr int    kMaxFetches     = 3;
+    int fetch_count = 0;
+
     for (auto& cmd : cmds) {
+        // Enforce total budget
+        if (out.tellp() >= static_cast<std::streampos>(kTotalLimit)) {
+            out << "[TOOL RESULTS TRUNCATED: budget exhausted]\n";
+            break;
+        }
+
         if (cmd.name == "fetch") {
+            if (fetch_count >= kMaxFetches) {
+                out << "[/fetch " << cmd.args << "]\n"
+                    << "SKIPPED: max " << kMaxFetches << " fetches per turn\n"
+                    << "[END FETCH]\n\n";
+                continue;
+            }
+            ++fetch_count;
             out << "[/fetch " << cmd.args << "]\n";
-            out << cmd_fetch(cmd.args) << "\n";
+            std::string fetched = cmd_fetch(cmd.args);
+            if (fetched.size() > kPerFetchLimit) {
+                fetched.resize(kPerFetchLimit);
+                fetched += "\n... [truncated]";
+            }
+            out << fetched << "\n";
             out << "[END FETCH]\n\n";
 
         } else if (cmd.name == "mem") {

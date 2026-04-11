@@ -29,6 +29,8 @@
 #include <sstream>
 #include <ctime>
 #include <cstdio>
+#include <unistd.h>
+#include <sys/select.h>
 
 namespace fs = std::filesystem;
 
@@ -310,6 +312,9 @@ struct LoopEntry {
     // Buffered output — loop runs silently; pull via /log <id>
     std::vector<std::string> output_log;
 
+    // Terminal-visible error message set when loop exits abnormally
+    std::string stop_reason;
+
     std::thread thread;
 
     LoopEntry() = default;
@@ -407,7 +412,9 @@ public:
                << "  state:" << loop_state_str(e->state)
                << "  iter:" << e->iter
                << "  elapsed:" << secs << "s\n";
-            if (!e->last_output.empty()) {
+            if (e->state == LoopState::Stopped && !e->stop_reason.empty()) {
+                ss << "    stop: " << e->stop_reason << "\n";
+            } else if (!e->last_output.empty()) {
                 // Show truncated last output as preview
                 std::string preview = e->last_output.substr(
                     0, std::min<size_t>(120, e->last_output.size()));
@@ -438,6 +445,34 @@ public:
         return ss.str();
     }
 
+    // Number of log entries (for tail-detection in /watch)
+    size_t log_count(const std::string& lid) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = loops_.find(lid);
+        if (it == loops_.end()) return 0;
+        return it->second->output_log.size();
+    }
+
+    // Return log entries starting at offset (for streaming new entries)
+    std::string log_since(const std::string& lid, size_t offset) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = loops_.find(lid);
+        if (it == loops_.end()) return "";
+        const auto& entries = it->second->output_log;
+        std::ostringstream ss;
+        for (size_t i = offset; i < entries.size(); ++i)
+            ss << entries[i];
+        return ss.str();
+    }
+
+    // True if the loop is stopped or no longer exists
+    bool is_stopped(const std::string& lid) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = loops_.find(lid);
+        if (it == loops_.end()) return true;
+        return it->second->state == LoopState::Stopped;
+    }
+
     // Reap any loops whose threads have finished
     void reap_stopped() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -460,25 +495,63 @@ private:
         // as a user message would make it appear to be echoed by a human.
         std::string prompt = initial_prompt;
         bool first = true;
+        bool stopped_by_request = false;
+        int  consecutive_idle = 0;         // iterations with no tool calls
+        int  total_iters      = 0;
+        static constexpr int kMaxIdle  = 2;   // stop after this many consecutive idle turns
+        static constexpr int kMaxIters = 20;  // hard ceiling
 
         while (true) {
+            // Enforce hard iteration ceiling
+            if (total_iters >= kMaxIters) {
+                e->stop_reason = "max iterations reached (" + std::to_string(kMaxIters) + ")";
+                {
+                    std::lock_guard<std::mutex> out(g_out_mu);
+                    std::cout << "\n\033[33m[" << e->loop_id << "/" << e->agent_id
+                              << " MAX ITERS]\033[0m " << e->stop_reason
+                              << "\n  Use /log " << e->loop_id << " to review.\n";
+                    std::cout.flush();
+                }
+                break;
+            }
+
             // Wait out any suspension (or stop)
             {
                 std::unique_lock<std::mutex> lk(e->mu);
                 e->cv.wait(lk, [e]{ return !e->suspend_req || e->stop_req; });
-                if (e->stop_req) break;
-                // Injected prompt resets the turn
+                if (e->stop_req) { stopped_by_request = true; break; }
+                // Injected prompt resets the idle counter and resumes active work
                 if (!e->injected.empty()) {
                     prompt = e->injected.front();
                     e->injected.pop();
                     first = true;
+                    consecutive_idle = 0;
                 }
+            }
+
+            // Log that this iteration is starting (visible via /watch before the API call returns)
+            {
+                std::ostringstream pre;
+                pre << "[" << e->loop_id << "/" << e->agent_id
+                    << " thinking...]\n";
+                std::lock_guard<std::mutex> ek(e->mu);
+                e->output_log.push_back(pre.str());
             }
 
             auto resp = orch.send(e->agent_id, prompt);
             e->iter++;
+            total_iters++;
 
-            // Buffer output; do NOT flood the interactive session.
+            // Track idle iterations (no tool calls = agent has nothing active to do)
+            if (resp.ok) {
+                if (resp.had_tool_calls) {
+                    consecutive_idle = 0;
+                } else {
+                    consecutive_idle++;
+                }
+            }
+
+            // Replace the "thinking..." placeholder with the real result
             {
                 std::ostringstream entry;
                 entry << "[" << e->loop_id << "/" << e->agent_id
@@ -492,10 +565,45 @@ private:
                     entry << "ERR: " << resp.error << "\n";
                 }
                 std::lock_guard<std::mutex> ek(e->mu);
-                e->output_log.push_back(entry.str());
+                // Replace the last entry (the "thinking..." placeholder)
+                if (!e->output_log.empty()) {
+                    e->output_log.back() = entry.str();
+                } else {
+                    e->output_log.push_back(entry.str());
+                }
             }
 
-            if (!resp.ok) break;
+            if (!resp.ok) {
+                e->stop_reason = resp.error;
+                // Notify the user immediately — loop died
+                {
+                    std::lock_guard<std::mutex> out(g_out_mu);
+                    std::cout << "\n\033[1;31m[" << e->loop_id << "/"
+                              << e->agent_id << " FAILED]\033[0m "
+                              << resp.error
+                              << "\n  Use /log " << e->loop_id
+                              << " to see output, /kill " << e->loop_id
+                              << " to dismiss.\n";
+                    std::cout.flush();
+                }
+                break;
+            }
+
+            // Auto-stop: agent has nothing left to do (no tool calls for N turns)
+            if (consecutive_idle >= kMaxIdle) {
+                e->stop_reason = "task complete (idle after " +
+                                 std::to_string(consecutive_idle) + " turns)";
+                {
+                    std::lock_guard<std::mutex> out(g_out_mu);
+                    std::cout << "\n\033[1;32m[" << e->loop_id << "/"
+                              << e->agent_id << " DONE]\033[0m "
+                              << e->stop_reason
+                              << "\n  Use /log " << e->loop_id
+                              << " to review, /kill " << e->loop_id << " to dismiss.\n";
+                    std::cout.flush();
+                }
+                break;
+            }
 
             // Don't feed output back as prompt — that causes the agent to
             // believe its own text is being echoed by a human, producing
@@ -506,11 +614,12 @@ private:
             prompt = "Continue.";
 
             // Re-check stop before sleeping
-            { std::lock_guard<std::mutex> lk(e->mu); if (e->stop_req) break; }
+            { std::lock_guard<std::mutex> lk(e->mu); if (e->stop_req) { stopped_by_request = true; break; } }
 
             // Brief pause between iterations to avoid hammering the API
             std::this_thread::sleep_for(std::chrono::seconds(2));
         }
+
         e->state = LoopState::Stopped;
     }
 
@@ -681,7 +790,6 @@ static void cmd_interactive() {
                 continue;
             }
             if (cmd == "loops") {
-                loops.reap_stopped();
                 std::cout << loops.list();
                 continue;
             }
@@ -736,6 +844,60 @@ static void cmd_interactive() {
                 std::cout << loops.log(lid, n);
                 continue;
             }
+            if (cmd == "watch") {
+                std::string lid;
+                iss >> lid;
+                if (lid.empty()) {
+                    std::cout << "Usage: /watch <loop-id>\n";
+                    continue;
+                }
+                if (loops.is_stopped(lid) && loops.log_count(lid) == 0) {
+                    std::cout << "ERR: no loop '" << lid << "'\n";
+                    continue;
+                }
+                // Dump everything buffered so far
+                size_t seen = loops.log_count(lid);
+                std::cout << loops.log(lid, 0);
+                if (!loops.is_stopped(lid)) {
+                    std::cout << "\033[2m--- watching " << lid
+                              << " — press Enter to detach ---\033[0m\n";
+                    std::cout.flush();
+                    // Tail new entries using select() for non-blocking stdin check
+                    while (!loops.is_stopped(lid)) {
+                        fd_set fds;
+                        FD_ZERO(&fds);
+                        FD_SET(STDIN_FILENO, &fds);
+                        struct timeval tv{0, 200000}; // 200 ms poll
+                        int rdy = ::select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
+                        if (rdy > 0) {
+                            // User pressed Enter — return to REPL
+                            std::string dummy;
+                            std::getline(std::cin, dummy);
+                            break;
+                        }
+                        // Print any new log entries
+                        size_t now = loops.log_count(lid);
+                        if (now > seen) {
+                            std::lock_guard<std::mutex> out(g_out_mu);
+                            std::cout << loops.log_since(lid, seen);
+                            std::cout.flush();
+                            seen = now;
+                        }
+                    }
+                    // Flush any remaining entries after stop
+                    size_t now = loops.log_count(lid);
+                    if (now > seen) {
+                        std::cout << loops.log_since(lid, seen);
+                    }
+                    if (loops.is_stopped(lid)) {
+                        std::cout << "\033[2m--- loop finished ---\033[0m\n";
+                    } else {
+                        std::cout << "\033[2m--- detached ---\033[0m\n";
+                    }
+                }
+                std::cout.flush();
+                continue;
+            }
             if (cmd == "fetch") {
                 std::string url;
                 iss >> url;
@@ -748,6 +910,12 @@ static void cmd_interactive() {
                 if (content.substr(0, 4) == "ERR:") {
                     std::cout << content << "\n";
                     continue;
+                }
+                // Cap at 32 KB to avoid bloating the agent's context window
+                static constexpr size_t kFetchLimit = 32768;
+                if (content.size() > kFetchLimit) {
+                    content.resize(kFetchLimit);
+                    content += "\n... [content truncated to 32 KB]";
                 }
                 // Inject into current agent as a user message
                 std::string msg = "[FETCHED: " + url + "]\n" + content +
@@ -855,6 +1023,7 @@ static void cmd_interactive() {
                     "  /loop <agent> <prompt>           — run agent in background loop\n"
                     "  /loops                           — list running/suspended loops\n"
                     "  /log <loop-id> [last-N]          — show buffered loop output\n"
+                    "  /watch <loop-id>                 — tail loop output live (Enter to detach)\n"
                     "  /kill <loop-id>                  — stop a loop\n"
                     "  /suspend <loop-id>               — pause a loop\n"
                     "  /resume <loop-id>                — resume a paused loop\n"

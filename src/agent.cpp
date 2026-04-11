@@ -15,6 +15,12 @@ ApiResponse Agent::send(const std::string& user_message) {
     // Add user message to history
     history_.push_back(Message{"user", user_message});
 
+    // Trim BEFORE building the request so we never send a bloated history.
+    // Threshold: keep 8 messages; trim when we exceed 12.
+    if (history_.size() > 12) {
+        trim_history(8);
+    }
+
     // Build request
     ApiRequest req;
     req.model = config_.model;
@@ -26,16 +32,28 @@ ApiResponse Agent::send(const std::string& user_message) {
     auto resp = client_.complete(req);
 
     if (resp.ok) {
+        // Tombstone: if the user message we just sent was a large [TOOL RESULTS]
+        // block, compress it in history now that the agent has processed it.
+        // The agent's response already incorporates those results; carrying the
+        // raw content forward is pure token waste.
+        static constexpr size_t kTombstoneThreshold = 4096;
+        if (!history_.empty()) {
+            auto& last_user = history_.back();
+            if (last_user.role == "user" &&
+                last_user.content.size() > kTombstoneThreshold &&
+                last_user.content.find("[TOOL RESULTS]") != std::string::npos) {
+                last_user.content =
+                    "[TOOL RESULTS - processed, " +
+                    std::to_string(last_user.content.size()) +
+                    " bytes, results incorporated in prior response]";
+            }
+        }
+
         // Add assistant response to history
         history_.push_back(Message{"assistant", resp.content});
         stats_.total_input_tokens  += resp.input_tokens;
         stats_.total_output_tokens += resp.output_tokens;
         stats_.total_requests++;
-    }
-
-    // Auto-trim if history grows large — keep window tight to stay under rate limits
-    if (history_.size() > 20) {
-        trim_history(10);
     }
 
     return resp;

@@ -38,6 +38,7 @@ struct ApiResponse {
     std::string error_type;          // e.g. "rate_limit_error", "overloaded_error"
     std::string raw_body;            // full response for debug
     std::string stop_reason;
+    bool had_tool_calls = false;     // true if orchestrator ran any /fetch or /mem commands
 };
 
 // Streaming callback: receives chunks as they arrive
