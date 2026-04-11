@@ -36,8 +36,7 @@ static const char* BANNER = R"(
  | |    | |/ _` | | | |/ _` | | | | / __|
  | |____| | (_| | |_| | (_| | | |_| \__ \
   \_____|_|\__,_|\__,_|\__,_|_|\__,_|___/
-                                    v0.1.0
-  Agent orchestrator. Few tokens. Full accuracy.
+                                    v0.1.1
 )";
 
 static std::string get_config_dir() {
