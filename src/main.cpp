@@ -39,7 +39,7 @@ namespace fs = std::filesystem;
 
 static const char* BANNER =
     "\n"
-    "Claudius                 v0.1.5\n"
+    "Claudius                 v0.1.6\n"
     "\033[38;5;208m"
     "\n"
     "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc\n"
