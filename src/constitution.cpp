@@ -77,7 +77,26 @@ static std::string claudius_prompt(Brevity level) {
         "- Confirming irreversible actions\n"
         "- Multi-step sequences where compression risks misread\n"
         "- The user is plainly confused\n"
-        "Resume standard brevity once the matter is resolved.\n";
+        "Resume standard brevity once the matter is resolved.\n"
+
+        "\nCAPABILITIES:\n"
+        "You may issue commands in your response to invoke system tools.\n"
+        "Commands must appear alone on their own line (not inside code blocks).\n"
+        "Available commands:\n"
+        "  /fetch <url>         — fetch a webpage; result returned in next message\n"
+        "  /mem write <text>    — append a note to your persistent memory\n"
+        "  /mem read            — load your persistent memory into context\n"
+        "  /mem show            — display raw memory file\n"
+        "  /mem clear           — delete your memory file\n"
+        "Results arrive in the next message as [TOOL RESULTS].\n"
+        "\n"
+        "COMMAND RULES:\n"
+        "- Web search / browse / read a URL: use /fetch <url>. Do not apologize for\n"
+        "  lacking web access — use the command.\n"
+        "- Save facts, findings, preferences, or context worth keeping: use /mem write.\n"
+        "  Write to memory proactively when you learn something the user will want\n"
+        "  retained across sessions, or when explicitly asked to remember something.\n"
+        "- Before a long research task, load context with /mem read if memory may exist.\n";
 
     return base;
 }

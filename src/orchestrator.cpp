@@ -1,7 +1,8 @@
 // claudius/src/orchestrator.cpp
 #include "orchestrator.h"
+#include "commands.h"
+#include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <sstream>
 #include <stdexcept>
 
@@ -12,6 +13,10 @@ namespace claudius {
 Orchestrator::Orchestrator(const std::string& api_key)
     : client_(api_key)
 {
+    // Default memory directory: ~/.claudius/memory
+    const char* home = std::getenv("HOME");
+    memory_dir_ = (home ? std::string(home) : std::string(".")) + "/.claudius/memory";
+
     // Create master Claudius agent
     auto master = master_constitution();
     claudius_master_ = std::make_unique<Agent>("claudius", master, client_);
@@ -73,16 +78,36 @@ void Orchestrator::load_agents(const std::string& dir) {
 }
 
 ApiResponse Orchestrator::send(const std::string& agent_id, const std::string& message) {
+    // Resolve agent pointer and build the first message.
+    Agent* agent_ptr;
+    std::string current_msg;
+
     if (agent_id == "claudius") {
-        return ask_claudius(message);
+        agent_ptr  = claudius_master_.get();
+        current_msg = global_status() + "\n\nQUERY: " + message;
+    } else {
+        agent_ptr  = &get_agent(agent_id);
+        current_msg = message;
     }
-    return get_agent(agent_id).send(message);
+
+    // Agentic dispatch loop: execute /fetch and /mem commands emitted by the
+    // agent and feed results back, up to 6 turns.
+    ApiResponse resp;
+    for (int i = 0; i < 6; ++i) {
+        resp = agent_ptr->send(current_msg);
+        if (!resp.ok) return resp;
+
+        auto cmds = parse_agent_commands(resp.content);
+        if (cmds.empty()) break;
+
+        current_msg = execute_agent_commands(cmds, agent_id, memory_dir_);
+    }
+
+    return resp;
 }
 
 ApiResponse Orchestrator::ask_claudius(const std::string& query) {
-    // Inject current system state into the query for context
-    std::string context = global_status() + "\n\nQUERY: " + query;
-    return claudius_master_->send(context);
+    return send("claudius", query);
 }
 
 std::string Orchestrator::global_status() const {

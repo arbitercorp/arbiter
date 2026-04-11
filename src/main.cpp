@@ -9,6 +9,7 @@
 //   claudius --gen-token              — generate new auth token
 
 #include "orchestrator.h"
+#include "commands.h"
 #include "server.h"
 #include "auth.h"
 #include "constitution.h"
@@ -39,8 +40,36 @@ static const char* BANNER =
     " | |    | |/ _` | | | |/ _` | | | | / __|\n"
     " | |____| | (_| | |_| | (_| | | |_| \\__ \\\n"
     "  \\_____|_|\\__,_|\\__,_|\\__,_|_|\\__,_|___/\n"
-    "                                    v0.1.2\n"
+    "                                    v0.1.3\n"
     "\033[0m";
+
+static std::string agent_color(const std::string& agent_id) {
+    if (agent_id == "claudius") return "\033[38;5;208m";  // orange
+
+    // Palette: vivid, distinct 256-color codes
+    static const int palette[] = {
+        75,   // cornflower blue
+        82,   // bright green
+        171,  // magenta
+        51,   // cyan
+        226,  // yellow
+        196,  // red
+        141,  // violet
+        214,  // dark orange
+        85,   // seafoam
+        207,  // pink
+        39,   // sky blue
+        154,  // lime
+    };
+    static const int palette_size = sizeof(palette) / sizeof(palette[0]);
+
+    size_t h = std::hash<std::string>{}(agent_id);
+    int code = palette[h % palette_size];
+
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "\033[38;5;%dm", code);
+    return buf;
+}
 
 static std::string get_config_dir() {
     const char* home = std::getenv("HOME");
@@ -56,60 +85,15 @@ static std::string get_memory_dir() {
     return dir;
 }
 
-// Append a timestamped entry to an agent's memory file.
+// Thin wrappers so the interactive REPL can call the shared implementations.
 static void write_memory(const std::string& agent_id, const std::string& text) {
-    std::string path = get_memory_dir() + "/" + agent_id + ".md";
-    std::ofstream f(path, std::ios::app);
-    if (!f.is_open()) {
-        std::cerr << "ERR: cannot write memory: " << path << "\n";
-        return;
-    }
-    // Timestamp
-    std::time_t now = std::time(nullptr);
-    char ts[32];
-    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
-    f << "\n<!-- " << ts << " -->\n" << text << "\n";
+    claudius::cmd_mem_write(agent_id, text, get_memory_dir());
 }
-
-// Read an agent's memory file. Returns empty string if none exists.
 static std::string read_memory(const std::string& agent_id) {
-    std::string path = get_memory_dir() + "/" + agent_id + ".md";
-    std::ifstream f(path);
-    if (!f.is_open()) return "";
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    return claudius::cmd_mem_read(agent_id, get_memory_dir());
 }
-
-// Fetch raw HTML from a URL using curl. Returns content or error string.
-// URL is validated to start with http:// or https:// to prevent injection.
 static std::string fetch_url(const std::string& url) {
-    // Validate: must start with http:// or https://
-    if (url.substr(0, 7) != "http://" && url.substr(0, 8) != "https://") {
-        return "ERR: URL must start with http:// or https://";
-    }
-    // Reject shell metacharacters
-    for (char c : url) {
-        if (c == '\'' || c == '"' || c == '`' || c == '$' ||
-            c == ';'  || c == '&' || c == '|' || c == '>' ||
-            c == '<'  || c == '\n'|| c == '\r') {
-            return "ERR: URL contains invalid characters";
-        }
-    }
-
-    std::string cmd = "curl -sL --max-time 15 --max-filesize 524288 '" + url + "' 2>&1";
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return "ERR: failed to run curl";
-
-    std::string result;
-    result.reserve(65536);
-    char buf[4096];
-    while (fgets(buf, sizeof(buf), pipe)) {
-        result += buf;
-        if (result.size() > 512 * 1024) break; // cap at 512KB
-    }
-    pclose(pipe);
-    return result;
+    return claudius::cmd_fetch(url);
 }
 
 static std::string get_api_key() {
@@ -231,6 +215,7 @@ static void cmd_serve(int port) {
     std::string api_key = get_api_key();
 
     claudius::Orchestrator orch(api_key);
+    orch.set_memory_dir(get_memory_dir());
     orch.load_agents(dir + "/agents");
 
     claudius::Auth auth;
@@ -539,6 +524,7 @@ static void cmd_interactive() {
     std::string api_key = get_api_key();
 
     claudius::Orchestrator orch(api_key);
+    orch.set_memory_dir(get_memory_dir());
     orch.load_agents(dir + "/agents");
 
     std::cout << BANNER;
@@ -554,7 +540,9 @@ static void cmd_interactive() {
     LoopManager loops;
 
     while (true) {
-        std::cout << "[" << current_agent << "] > ";
+        std::cout << agent_color(current_agent)
+                  << "[" << current_agent << "]"
+                  << "\033[0m > ";
         std::cout.flush();
 
         std::string line;
