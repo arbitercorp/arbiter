@@ -1,3 +1,6 @@
+**Warning**
+> Claudius is under active development and should be considered unstable. Interfaces, agent constitution formats, and runtime behavior are subject to breaking changes. No stability guarantees are made at this time.  
+
 <p align="center" style="font-size: 48px;">
   🏛️
 </p>
