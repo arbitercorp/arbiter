@@ -354,43 +354,151 @@ ApiResponse ApiClient::complete(const ApiRequest& req) {
     return r;
 }
 
-ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
-    std::lock_guard<std::mutex> lock(conn_mutex_);
+// ─── SSE helpers ─────────────────────────────────────────────────────────────
 
+static void process_sse_event(const std::string& data,
+                              std::string& content,
+                              ApiResponse& resp,
+                              StreamCallback cb) {
+    if (data.empty() || data == "[DONE]") return;
     try {
-        if (!ensure_connection()) {
-            ApiResponse r;
-            r.ok    = false;
-            r.error = "Connection failed";
-            return r;
+        auto root = json_parse(data);
+        std::string type = root->get_string("type");
+
+        if (type == "content_block_delta") {
+            auto delta = root->get("delta");
+            if (delta && delta->get_string("type") == "text_delta") {
+                std::string text = delta->get_string("text");
+                content += text;
+                if (cb) cb(text);
+            }
+        } else if (type == "message_start") {
+            auto msg = root->get("message");
+            if (msg) {
+                auto usage = msg->get("usage");
+                if (usage) {
+                    resp.input_tokens          = usage->get_int("input_tokens");
+                    resp.cache_creation_tokens = usage->get_int("cache_creation_input_tokens");
+                    resp.cache_read_tokens     = usage->get_int("cache_read_input_tokens");
+                }
+            }
+        } else if (type == "message_delta") {
+            auto delta = root->get("delta");
+            if (delta) resp.stop_reason = delta->get_string("stop_reason");
+            auto usage = root->get("usage");
+            if (usage) resp.output_tokens = usage->get_int("output_tokens");
+        } else if (type == "error") {
+            resp.ok = false;
+            auto err = root->get("error");
+            if (err) resp.error = err->get_string("message", "Stream error");
         }
+    } catch (...) {
+        // Ignore malformed SSE events
+    }
+}
 
-        std::string body = build_request_body(req, true);
-        send_request(body, true);
-        std::string raw = read_response(true, cb);
+ApiResponse ApiClient::read_streaming_response(StreamCallback cb) {
+    ApiResponse resp;
+    resp.ok = true;
+    std::string content;
 
-        // For streaming, parse the accumulated SSE data to get final usage
-        ApiResponse resp;
-        resp.ok       = true;
-        resp.raw_body = raw;
+    // Read HTTP headers byte-by-byte
+    std::string headers;
+    {
+        char ch;
+        while (true) {
+            int n = SSL_read(ssl_, &ch, 1);
+            if (n <= 0) { resp.ok = false; resp.error = "Connection closed reading headers"; return resp; }
+            headers += ch;
+            if (headers.size() >= 4 &&
+                headers.substr(headers.size() - 4) == "\r\n\r\n") break;
+        }
+    }
 
-        std::istringstream stream_data(raw);
-        std::string line;
-        while (std::getline(stream_data, line)) {
-            if (line.find("\"type\":\"message_delta\"") != std::string::npos) {
-                try {
-                    auto upos = line.find("\"output_tokens\":");
-                    if (upos != std::string::npos) {
-                        resp.output_tokens = std::atoi(line.c_str() + upos + 16);
-                    }
-                } catch (...) {}
+    bool chunked = headers.find("Transfer-Encoding: chunked") != std::string::npos;
+
+    // Line buffer for SSE event reassembly across chunk boundaries
+    std::string line_buf;
+    char buf[4096];
+
+    auto process_line = [&](const std::string& line) {
+        if (line.empty() || line == "\r") return;
+        if (line.size() > 6 && line.substr(0, 6) == "data: ") {
+            std::string data = line.substr(6);
+            if (!data.empty() && data.back() == '\r') data.pop_back();
+            process_sse_event(data, content, resp, cb);
+        }
+    };
+
+    auto feed = [&](const char* data, int n) {
+        for (int i = 0; i < n; ++i) {
+            if (data[i] == '\n') {
+                process_line(line_buf);
+                line_buf.clear();
+            } else {
+                line_buf += data[i];
             }
         }
+    };
 
-        total_in_  += resp.input_tokens;
-        total_out_ += resp.output_tokens;
+    if (chunked) {
+        while (true) {
+            // Read chunk size line
+            std::string size_line;
+            while (true) {
+                int n = SSL_read(ssl_, buf, 1);
+                if (n <= 0) goto stream_done;
+                if (buf[0] == '\n') break;
+                if (buf[0] != '\r') size_line += buf[0];
+            }
+            int chunk_size = static_cast<int>(std::strtol(size_line.c_str(), nullptr, 16));
+            if (chunk_size == 0) break;
+
+            int read_so_far = 0;
+            while (read_so_far < chunk_size) {
+                int to_read = std::min(chunk_size - read_so_far, (int)sizeof(buf));
+                int n = SSL_read(ssl_, buf, to_read);
+                if (n <= 0) goto stream_done;
+                feed(buf, n);
+                read_so_far += n;
+            }
+            SSL_read(ssl_, buf, 2);  // trailing \r\n
+        }
+        SSL_read(ssl_, buf, 2);  // final \r\n
+    } else {
+        int content_length = -1;
+        auto cl_pos = headers.find("Content-Length: ");
+        if (cl_pos != std::string::npos)
+            content_length = std::atoi(headers.c_str() + cl_pos + 16);
+        int read_so_far = 0;
+        while (content_length < 0 || read_so_far < content_length) {
+            int n = SSL_read(ssl_, buf, sizeof(buf));
+            if (n <= 0) break;
+            feed(buf, n);
+            read_so_far += n;
+        }
+    }
+
+stream_done:
+    if (!line_buf.empty()) process_line(line_buf);
+    resp.content = content;
+    return resp;
+}
+
+ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
+    std::lock_guard<std::mutex> lock(conn_mutex_);
+    try {
+        if (!ensure_connection()) {
+            ApiResponse r; r.ok = false; r.error = "Connection failed"; return r;
+        }
+        std::string body = build_request_body(req, true);
+        send_request(body, true);
+        ApiResponse resp = read_streaming_response(cb);
+        if (resp.ok) {
+            total_in_  += resp.input_tokens;
+            total_out_ += resp.output_tokens;
+        }
         return resp;
-
     } catch (const std::exception& e) {
         close_connection();
         ApiResponse r;

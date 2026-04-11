@@ -47,6 +47,18 @@ std::vector<AgentCommand> parse_agent_commands(const std::string& response) {
             cmd.name = "mem";
             cmd.args = line.substr(5);
             if (!cmd.args.empty()) result.push_back(std::move(cmd));
+
+        } else if (line.size() > 7 && line.substr(0, 7) == "/agent ") {
+            AgentCommand cmd;
+            cmd.name = "agent";
+            cmd.args = line.substr(7);
+            if (!cmd.args.empty()) result.push_back(std::move(cmd));
+
+        } else if (line.size() > 6 && line.substr(0, 6) == "/exec ") {
+            AgentCommand cmd;
+            cmd.name = "exec";
+            cmd.args = line.substr(6);
+            if (!cmd.args.empty()) result.push_back(std::move(cmd));
         }
     }
 
@@ -183,6 +195,46 @@ std::string cmd_fetch(const std::string& url) {
 }
 
 // ---------------------------------------------------------------------------
+// cmd_exec
+// ---------------------------------------------------------------------------
+
+std::string cmd_exec(const std::string& command) {
+    static constexpr size_t kMaxOutput = 32768;
+
+    if (command.empty()) return "ERR: empty command";
+
+    // Capture stdout and stderr together
+    std::string shell_cmd = command + " 2>&1";
+    FILE* pipe = popen(shell_cmd.c_str(), "r");
+    if (!pipe) return "ERR: popen failed";
+
+    std::string output;
+    output.reserve(4096);
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        output += buf;
+        if (output.size() > kMaxOutput) {
+            output.resize(kMaxOutput);
+            output += "\n... [truncated at 32 KB]";
+            break;
+        }
+    }
+    int status = pclose(pipe);
+
+    // Trim trailing newlines
+    while (!output.empty() && output.back() == '\n')
+        output.pop_back();
+
+    if (output.empty()) output = "(no output)";
+
+    if (status != 0) {
+        output += "\n[exit " + std::to_string(status) + "]";
+    }
+
+    return output;
+}
+
+// ---------------------------------------------------------------------------
 // Memory helpers
 // ---------------------------------------------------------------------------
 
@@ -219,7 +271,8 @@ void cmd_mem_clear(const std::string& agent_id, const std::string& memory_dir) {
 
 std::string execute_agent_commands(const std::vector<AgentCommand>& cmds,
                                    const std::string& agent_id,
-                                   const std::string& memory_dir) {
+                                   const std::string& memory_dir,
+                                   AgentInvoker agent_invoker) {
     std::ostringstream out;
     out << "[TOOL RESULTS]\n";
 
@@ -282,6 +335,28 @@ std::string execute_agent_commands(const std::vector<AgentCommand>& cmds,
                 cmd_mem_clear(agent_id, memory_dir);
                 out << "[/mem clear] OK: memory cleared\n\n";
             }
+
+        } else if (cmd.name == "exec") {
+            out << "[/exec " << cmd.args << "]\n";
+            out << cmd_exec(cmd.args) << "\n";
+            out << "[END EXEC]\n\n";
+
+        } else if (cmd.name == "agent") {
+            // /agent <sub_agent_id> <message>
+            std::istringstream iss(cmd.args);
+            std::string sub_id;
+            iss >> sub_id;
+            std::string sub_msg;
+            std::getline(iss, sub_msg);
+            if (!sub_msg.empty() && sub_msg[0] == ' ') sub_msg.erase(0, 1);
+
+            out << "[/agent " << sub_id << "]\n";
+            if (agent_invoker) {
+                out << agent_invoker(sub_id, sub_msg) << "\n";
+            } else {
+                out << "ERR: agent invocation unavailable in this context\n";
+            }
+            out << "[END AGENT]\n\n";
         }
     }
 

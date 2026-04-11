@@ -3,6 +3,7 @@
 
 #include "agent.h"
 #include "api_client.h"
+#include "commands.h"
 #include <string>
 #include <unordered_map>
 #include <memory>
@@ -34,8 +35,17 @@ public:
     // automatically (up to 6 turns).
     ApiResponse send(const std::string& agent_id, const std::string& message);
 
+    // Streaming variant of send() — streams first turn via callback,
+    // falls back to non-streaming for tool-call re-entry turns.
+    ApiResponse send_streaming(const std::string& agent_id,
+                               const std::string& message,
+                               StreamCallback cb);
+
     // Ask Claudius (master) about system state
     ApiResponse ask_claudius(const std::string& query);
+
+    // Return the model string for a given agent (or master if id == "claudius")
+    std::string get_agent_model(const std::string& id) const;
 
     // Global stats
     std::string global_status() const;
@@ -54,6 +64,9 @@ private:
 
     // Master Claudius agent for meta-queries
     std::unique_ptr<Agent> claudius_master_;
+
+    // Build an AgentInvoker lambda for use in command dispatch
+    AgentInvoker make_invoker(const std::string& caller_id);
 };
 
 } // namespace claudius

@@ -20,8 +20,11 @@ class Agent {
 public:
     Agent(const std::string& id, Constitution config, ApiClient& client);
 
-    // Send a message and get response
+    // Send a message and get response (blocking)
     ApiResponse send(const std::string& user_message);
+
+    // Send with streaming — chunks delivered via callback as they arrive
+    ApiResponse stream(const std::string& user_message, StreamCallback cb);
 
     // Clear conversation history (keep constitution)
     void reset_history();

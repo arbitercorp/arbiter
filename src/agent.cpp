@@ -59,6 +59,41 @@ ApiResponse Agent::send(const std::string& user_message) {
     return resp;
 }
 
+ApiResponse Agent::stream(const std::string& user_message, StreamCallback cb) {
+    history_.push_back(Message{"user", user_message});
+    if (history_.size() > 12) trim_history(8);
+
+    ApiRequest req;
+    req.model         = config_.model;
+    req.system_prompt = config_.build_system_prompt();
+    req.max_tokens    = config_.max_tokens;
+    req.temperature   = config_.temperature;
+    req.messages      = history_;
+
+    auto resp = client_.stream(req, cb);
+
+    if (resp.ok) {
+        static constexpr size_t kTombstoneThreshold = 4096;
+        if (!history_.empty()) {
+            auto& last_user = history_.back();
+            if (last_user.role == "user" &&
+                last_user.content.size() > kTombstoneThreshold &&
+                last_user.content.find("[TOOL RESULTS]") != std::string::npos) {
+                last_user.content =
+                    "[TOOL RESULTS - processed, " +
+                    std::to_string(last_user.content.size()) +
+                    " bytes, results incorporated in prior response]";
+            }
+        }
+        history_.push_back(Message{"assistant", resp.content});
+        stats_.total_input_tokens  += resp.input_tokens;
+        stats_.total_output_tokens += resp.output_tokens;
+        stats_.total_requests++;
+    }
+
+    return resp;
+}
+
 void Agent::reset_history() {
     history_.clear();
 }

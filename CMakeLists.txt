@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(claudius VERSION 0.1.4 LANGUAGES CXX)
+project(claudius VERSION 0.1.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +36,8 @@ set(CLAUDIUS_SOURCES
     src/auth.cpp
     src/json.cpp
     src/commands.cpp
+    src/readline_wrapper.cpp
+    src/cost_tracker.cpp
 )
 
 add_executable(claudius ${CLAUDIUS_SOURCES})
@@ -50,6 +52,31 @@ target_link_libraries(claudius PRIVATE
     OpenSSL::SSL
     OpenSSL::Crypto
 )
+
+# --- Readline / libedit for interactive line editing ---
+# Try libedit first (BSD license, ships on macOS)
+find_library(EDITLINE_LIB edit)
+find_path(EDITLINE_INCLUDE editline/readline.h)
+
+if(NOT EDITLINE_LIB OR NOT EDITLINE_INCLUDE)
+    find_library(EDITLINE_LIB readline)
+    find_path(EDITLINE_INCLUDE readline/readline.h)
+    if(EDITLINE_LIB AND EDITLINE_INCLUDE)
+        set(READLINE_GNU ON)
+    endif()
+endif()
+
+if(EDITLINE_LIB AND EDITLINE_INCLUDE)
+    message(STATUS "Found readline/libedit: ${EDITLINE_LIB}")
+    target_compile_definitions(claudius PRIVATE CLAUDIUS_HAS_READLINE)
+    if(NOT READLINE_GNU)
+        target_compile_definitions(claudius PRIVATE CLAUDIUS_USE_EDITLINE)
+    endif()
+    target_include_directories(claudius PRIVATE ${EDITLINE_INCLUDE})
+    target_link_libraries(claudius PRIVATE ${EDITLINE_LIB})
+else()
+    message(WARNING "readline/libedit not found; falling back to raw getline (no line editing)")
+endif()
 
 # --- Install ---
 install(TARGETS claudius RUNTIME DESTINATION bin)

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace fs = std::filesystem;
 
@@ -77,21 +78,45 @@ void Orchestrator::load_agents(const std::string& dir) {
     }
 }
 
+// Build an AgentInvoker that delegates to a named sub-agent.
+// caller_id is excluded to prevent direct self-recursion.
+AgentInvoker Orchestrator::make_invoker(const std::string& caller_id) {
+    return [this, caller_id](const std::string& sub_id, const std::string& sub_msg) -> std::string {
+        if (sub_id == caller_id) return "ERR: agent cannot invoke itself";
+        if (sub_id == "claudius") return "ERR: recursive claudius invocation not permitted";
+
+        // Get pointer while holding the lock, then release before calling send
+        Agent* sub = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(agents_mutex_);
+            auto it = agents_.find(sub_id);
+            if (it == agents_.end())
+                return "ERR: no agent '" + sub_id + "'";
+            sub = it->second.get();
+        }
+
+        auto sub_resp = sub->send(sub_msg);
+        return sub_resp.ok ? sub_resp.content : "ERR: " + sub_resp.error;
+    };
+}
+
 ApiResponse Orchestrator::send(const std::string& agent_id, const std::string& message) {
     // Resolve agent pointer and build the first message.
     Agent* agent_ptr;
     std::string current_msg;
 
     if (agent_id == "claudius") {
-        agent_ptr  = claudius_master_.get();
+        agent_ptr   = claudius_master_.get();
         current_msg = global_status() + "\n\nQUERY: " + message;
     } else {
-        agent_ptr  = &get_agent(agent_id);
+        agent_ptr   = &get_agent(agent_id);
         current_msg = message;
     }
 
-    // Agentic dispatch loop: execute /fetch and /mem commands emitted by the
-    // agent and feed results back, up to 6 turns.
+    auto invoker = make_invoker(agent_id);
+
+    // Agentic dispatch loop: execute commands emitted by the agent and feed
+    // results back, up to 6 turns.
     ApiResponse resp;
     for (int i = 0; i < 6; ++i) {
         resp = agent_ptr->send(current_msg);
@@ -101,7 +126,45 @@ ApiResponse Orchestrator::send(const std::string& agent_id, const std::string& m
         if (cmds.empty()) break;
 
         resp.had_tool_calls = true;
-        current_msg = execute_agent_commands(cmds, agent_id, memory_dir_);
+        current_msg = execute_agent_commands(cmds, agent_id, memory_dir_, invoker);
+    }
+
+    return resp;
+}
+
+ApiResponse Orchestrator::send_streaming(const std::string& agent_id,
+                                         const std::string& message,
+                                         StreamCallback cb) {
+    Agent* agent_ptr;
+    std::string current_msg;
+
+    if (agent_id == "claudius") {
+        agent_ptr   = claudius_master_.get();
+        current_msg = global_status() + "\n\nQUERY: " + message;
+    } else {
+        agent_ptr   = &get_agent(agent_id);
+        current_msg = message;
+    }
+
+    // First turn: stream to caller
+    ApiResponse resp = agent_ptr->stream(current_msg, cb);
+    if (!resp.ok) return resp;
+
+    auto cmds = parse_agent_commands(resp.content);
+    if (cmds.empty()) return resp;
+
+    auto invoker = make_invoker(agent_id);
+
+    // Tool-call re-entry turns: stream each so the user can follow progress
+    resp.had_tool_calls = true;
+    for (int i = 0; i < 5; ++i) {
+        cb("\n");  // end the previous streamed line before tool output
+        current_msg = execute_agent_commands(cmds, agent_id, memory_dir_, invoker);
+        resp = agent_ptr->stream(current_msg, cb);
+        if (!resp.ok) return resp;
+        cmds = parse_agent_commands(resp.content);
+        if (cmds.empty()) break;
+        resp.had_tool_calls = true;
     }
 
     return resp;
@@ -109,6 +172,14 @@ ApiResponse Orchestrator::send(const std::string& agent_id, const std::string& m
 
 ApiResponse Orchestrator::ask_claudius(const std::string& query) {
     return send("claudius", query);
+}
+
+std::string Orchestrator::get_agent_model(const std::string& id) const {
+    if (id == "claudius") return claudius_master_->config().model;
+    std::lock_guard<std::mutex> lock(agents_mutex_);
+    auto it = agents_.find(id);
+    if (it == agents_.end()) return "";
+    return it->second->config().model;
 }
 
 std::string Orchestrator::global_status() const {

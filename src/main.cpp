@@ -13,6 +13,8 @@
 #include "server.h"
 #include "auth.h"
 #include "constitution.h"
+#include "readline_wrapper.h"
+#include "cost_tracker.h"
 
 #include <iostream>
 #include <string>
@@ -36,7 +38,7 @@ namespace fs = std::filesystem;
 
 static const char* BANNER =
     "\n"
-    "Claudius                 v0.1.4\n"
+    "Claudius                 v0.1.5\n"
     "\033[38;5;208m"
     "\n"
     "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc\n"
@@ -325,6 +327,9 @@ struct LoopEntry {
     // Terminal-visible error message set when loop exits abnormally
     std::string stop_reason;
 
+    // Optional cost tracker for per-loop cost accounting
+    claudius::CostTracker* tracker = nullptr;
+
     std::thread thread;
 
     LoopEntry() = default;
@@ -351,7 +356,8 @@ public:
     // Start a new loop; returns the loop ID.
     std::string start(claudius::Orchestrator& orch,
                       const std::string& agent_id,
-                      const std::string& initial_prompt) {
+                      const std::string& initial_prompt,
+                      claudius::CostTracker* tracker = nullptr) {
         std::lock_guard<std::mutex> lk(mu_);
         std::string lid = "loop-" + std::to_string(next_id_++);
         auto e = std::make_unique<LoopEntry>();
@@ -359,6 +365,7 @@ public:
         e->agent_id = agent_id;
         e->started  = std::chrono::steady_clock::now();
         e->state    = LoopState::Running;
+        e->tracker  = tracker;
         e->thread   = std::thread(run_loop, e.get(), std::ref(orch), initial_prompt);
         loops_[lid] = std::move(e);
         return lid;
@@ -496,6 +503,29 @@ public:
         }
     }
 
+    // Return all loop IDs (for tab completion)
+    std::vector<std::string> list_ids() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<std::string> ids;
+        for (auto& [lid, _] : loops_) ids.push_back(lid);
+        return ids;
+    }
+
+    bool has_active() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& [_, e] : loops_)
+            if (e->state != LoopState::Stopped) return true;
+        return false;
+    }
+
+    int active_count() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        int n = 0;
+        for (auto& [_, e] : loops_)
+            if (e->state != LoopState::Stopped) ++n;
+        return n;
+    }
+
 private:
     static void run_loop(LoopEntry* e, claudius::Orchestrator& orch,
                          std::string initial_prompt) {
@@ -567,9 +597,15 @@ private:
                 entry << "[" << e->loop_id << "/" << e->agent_id
                       << " #" << e->iter << "]\n";
                 if (resp.ok) {
-                    entry << resp.content << "\n"
-                          << "  [in:" << resp.input_tokens
-                          << " out:" << resp.output_tokens << "]\n";
+                    entry << resp.content << "\n";
+                    if (e->tracker) {
+                        std::string model = orch.get_agent_model(e->agent_id);
+                        e->tracker->record(e->agent_id, model, resp);
+                        entry << "  " << e->tracker->format_footer(resp, model) << "\n";
+                    } else {
+                        entry << "  [in:" << resp.input_tokens
+                              << " out:" << resp.output_tokens << "]\n";
+                    }
                     e->last_output = resp.content;
                 } else {
                     entry << "ERR: " << resp.error << "\n";
@@ -660,16 +696,98 @@ static void cmd_interactive() {
     std::string current_agent = "claudius";
     ThinkingIndicator thinking;
     LoopManager loops;
+    claudius::ReadlineWrapper rl;
+    claudius::CostTracker tracker;
+    bool exit_warned = false;
+
+    rl.set_max_history(1000);
+    rl.load_history(get_config_dir() + "/history");
+
+    // Tab completion: slash commands, agent names, loop IDs
+    rl.set_completion_provider(
+        [&orch, &loops](const std::string& buf, const std::string& tok)
+        -> std::vector<std::string> {
+            auto match = [&](const std::vector<std::string>& candidates) {
+                std::vector<std::string> out;
+                for (auto& c : candidates)
+                    if (c.substr(0, tok.size()) == tok) out.push_back(c);
+                return out;
+            };
+
+            // Extract first word from buffer (the command)
+            std::string cmd;
+            {
+                std::istringstream iss(buf);
+                iss >> cmd;
+                if (!cmd.empty() && cmd[0] == '/') cmd = cmd.substr(1);
+            }
+            bool only_cmd = (buf.find(' ') == std::string::npos);
+
+            // Completing the slash command itself
+            if (only_cmd || buf.empty()) {
+                return match({"/send","/ask","/use","/list","/status","/tokens",
+                              "/create","/remove","/reset","/model",
+                              "/loop","/loops","/log","/watch",
+                              "/kill","/suspend","/resume","/inject",
+                              "/fetch","/mem","/quit","/help"});
+            }
+
+            // Agent name completion
+            if (cmd == "send" || cmd == "use" || cmd == "loop" || cmd == "model") {
+                auto agents = orch.list_agents();
+                agents.push_back("claudius");
+                return match(agents);
+            }
+
+            // Loop ID completion
+            if (cmd == "kill"    || cmd == "suspend" || cmd == "resume" ||
+                cmd == "watch"   || cmd == "log"     || cmd == "inject") {
+                return match(loops.list_ids());
+            }
+
+            // /mem subcommands
+            if (cmd == "mem") {
+                return match({"write","read","show","clear"});
+            }
+
+            return {};
+        });
 
     while (true) {
-        std::cout << agent_color(current_agent)
-                  << "[" << current_agent << "]"
-                  << "\033[0m > ";
-        std::cout.flush();
+        std::string prompt =
+            agent_color(current_agent)
+            + "[" + current_agent + "]"
+            + "\033[0m > ";
 
         std::string line;
-        if (!std::getline(std::cin, line)) break;
+        if (!rl.read_line(prompt, line)) {
+            std::cout << "\n";
+            break;
+        }
         if (line.empty()) continue;
+
+        // Intercept bare exit/quit commands (no slash required)
+        {
+            std::string lower = line;
+            for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            // trim whitespace
+            while (!lower.empty() && lower.back()  == ' ') lower.pop_back();
+            while (!lower.empty() && lower.front() == ' ') lower.erase(lower.begin());
+
+            if (lower == "exit" || lower == "quit" || lower == "q" ||
+                lower == "bye"  || lower == ":q") {
+                if (loops.has_active() && !exit_warned) {
+                    std::cout << "WARN: " << loops.active_count()
+                              << " loop(s) still running.\n";
+                    std::cout << "Type 'exit' again to force quit, or /loops to review.\n";
+                    exit_warned = true;
+                    continue;
+                }
+                break;
+            } else {
+                exit_warned = false;
+            }
+        }
 
         if (line[0] == '/') {
             // Parse command
@@ -689,8 +807,7 @@ static void cmd_interactive() {
                 continue;
             }
             if (cmd == "tokens") {
-                std::cout << "in:" << orch.total_input_tokens()
-                          << " out:" << orch.total_output_tokens() << "\n";
+                std::cout << tracker.format_summary();
                 continue;
             }
             if (cmd == "use" || cmd == "switch") {
@@ -711,19 +828,17 @@ static void cmd_interactive() {
                 std::getline(iss, msg);
                 if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
                 try {
-                    thinking.start();
-                    auto resp = orch.send(id, msg);
-                    thinking.stop();
                     std::lock_guard<std::mutex> out(g_out_mu);
+                    auto resp = orch.send_streaming(id, msg,
+                        [](const std::string& chunk) { std::cout << chunk << std::flush; });
+                    std::cout << "\n";
                     if (resp.ok) {
-                        std::cout << resp.content << "\n";
-                        std::cout << "  [in:" << resp.input_tokens
-                                  << " out:" << resp.output_tokens << "]\n";
+                        tracker.record(id, orch.get_agent_model(id), resp);
+                        std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model(id)) << "\n";
                     } else {
                         std::cout << "ERR: " << resp.error << "\n";
                     }
                 } catch (const std::exception& e) {
-                    thinking.stop();
                     std::cout << "ERR: " << e.what() << "\n";
                 }
                 continue;
@@ -733,19 +848,17 @@ static void cmd_interactive() {
                 std::getline(iss, query);
                 if (!query.empty() && query[0] == ' ') query.erase(0, 1);
                 try {
-                    thinking.start();
-                    auto resp = orch.ask_claudius(query);
-                    thinking.stop();
                     std::lock_guard<std::mutex> out(g_out_mu);
+                    auto resp = orch.send_streaming("claudius", query,
+                        [](const std::string& chunk) { std::cout << chunk << std::flush; });
+                    std::cout << "\n";
                     if (resp.ok) {
-                        std::cout << resp.content << "\n";
-                        std::cout << "  [in:" << resp.input_tokens
-                                  << " out:" << resp.output_tokens << "]\n";
+                        tracker.record("claudius", orch.get_agent_model("claudius"), resp);
+                        std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model("claudius")) << "\n";
                     } else {
                         std::cout << "ERR: " << resp.error << "\n";
                     }
                 } catch (const std::exception& e) {
-                    thinking.stop();
                     std::cout << "ERR: " << e.what() << "\n";
                 }
                 continue;
@@ -798,7 +911,7 @@ static void cmd_interactive() {
                     std::cout << "ERR: no agent '" << id << "'\n";
                     continue;
                 }
-                std::string lid = loops.start(orch, id, prompt);
+                std::string lid = loops.start(orch, id, prompt, &tracker);
                 std::cout << "Loop started: " << lid << " (agent: " << id << ")\n";
                 continue;
             }
@@ -940,8 +1053,8 @@ static void cmd_interactive() {
                     std::lock_guard<std::mutex> out(g_out_mu);
                     if (resp.ok) {
                         std::cout << resp.content << "\n";
-                        std::cout << "  [in:" << resp.input_tokens
-                                  << " out:" << resp.output_tokens << "]\n";
+                        tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
+                        std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model(current_agent)) << "\n";
                     } else {
                         std::cout << "ERR: " << resp.error << "\n";
                     }
@@ -980,8 +1093,8 @@ static void cmd_interactive() {
                         std::lock_guard<std::mutex> out(g_out_mu);
                         if (resp.ok) {
                             std::cout << resp.content << "\n";
-                            std::cout << "  [in:" << resp.input_tokens
-                                      << " out:" << resp.output_tokens << "]\n";
+                            tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
+                            std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model(current_agent)) << "\n";
                         } else {
                             std::cout << "ERR: " << resp.error << "\n";
                         }
@@ -1058,26 +1171,29 @@ static void cmd_interactive() {
             continue;
         }
 
-        // Plain text → send to current agent
+        // Plain text → stream to current agent
         try {
-            thinking.start();
-            auto resp = orch.send(current_agent, line);
-            thinking.stop();
             std::lock_guard<std::mutex> out(g_out_mu);
+            auto resp = orch.send_streaming(current_agent, line,
+                [](const std::string& chunk) { std::cout << chunk << std::flush; });
+            std::cout << "\n";
             if (resp.ok) {
-                std::cout << resp.content << "\n";
-                std::cout << "  [in:" << resp.input_tokens
-                          << " out:" << resp.output_tokens << "]\n";
+                tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
+                std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model(current_agent)) << "\n";
             } else {
                 std::cout << "ERR: " << resp.error << "\n";
             }
         } catch (const std::exception& e) {
-            thinking.stop();
             std::cout << "ERR: " << e.what() << "\n";
         }
     }
 
-    std::cout << "\n" << orch.global_status();
+    // Session summary on exit
+    std::cout << "\n";
+    if (tracker.session_cost() > 0.0) {
+        std::cout << tracker.format_summary();
+    }
+    std::cout << orch.global_status();
 }
 
 static void cmd_oneshot(const std::string& agent_id, const std::string& msg) {

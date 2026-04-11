@@ -79,6 +79,7 @@ private:
     void close_connection();
     std::string send_request(const std::string& body, bool streaming);
     std::string read_response(bool streaming, StreamCallback cb);
+    ApiResponse read_streaming_response(StreamCallback cb);
 
     static std::string build_request_body(const ApiRequest& req, bool streaming);
     static ApiResponse parse_response(const std::string& body);

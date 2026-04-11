@@ -3,6 +3,7 @@
 
 #include <string>
 #include <vector>
+#include <functional>
 
 namespace claudius {
 
@@ -18,6 +19,10 @@ std::vector<AgentCommand> parse_agent_commands(const std::string& response);
 // Fetch a URL via curl. Returns content or "ERR: ..." on failure.
 std::string cmd_fetch(const std::string& url);
 
+// Execute a shell command. Returns stdout+stderr, or "ERR: ..." on failure.
+// Output is capped at 32 KB. Exit status appended if non-zero.
+std::string cmd_exec(const std::string& command);
+
 // Read the agent's persistent memory file. Returns "" if none.
 std::string cmd_mem_read(const std::string& agent_id, const std::string& memory_dir);
 
@@ -28,10 +33,16 @@ void cmd_mem_write(const std::string& agent_id, const std::string& text,
 // Delete the agent's memory file.
 void cmd_mem_clear(const std::string& agent_id, const std::string& memory_dir);
 
+// Callback for agent-to-agent invocation: given (sub_agent_id, message),
+// returns the sub-agent's response text or an "ERR: ..." string.
+using AgentInvoker = std::function<std::string(const std::string&, const std::string&)>;
+
 // Execute a parsed command list and return a [TOOL RESULTS] message
 // suitable for feeding back to the agent.
+// agent_invoker: optional — if provided, /agent commands are dispatched through it.
 std::string execute_agent_commands(const std::vector<AgentCommand>& cmds,
                                    const std::string& agent_id,
-                                   const std::string& memory_dir);
+                                   const std::string& memory_dir,
+                                   AgentInvoker agent_invoker = nullptr);
 
 } // namespace claudius
