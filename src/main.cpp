@@ -34,13 +34,14 @@
 #include <cstdio>
 #include <unistd.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
 
 namespace fs = std::filesystem;
 
 static const char* BANNER =
     "\n"
     "————————————————————————————————\n"
-    "| Claudius              v0.1.8 |\n"
+    "| Claudius              v0.2.0 |\n"
     "————————————————————————————————\n"
     "\033[38;5;208m"
     "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbc\n"
@@ -318,19 +319,216 @@ static void cmd_serve(int port) {
     std::cout << "Final stats: " << orch.global_status() << "\n";
 }
 
+// ─── Terminal / TUI ──────────────────────────────────────────────────────────
+
+static volatile sig_atomic_t g_winch = 0;
+static void sigwinch_handler(int) { g_winch = 1; }
+
+static int term_cols() {
+    struct winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return ws.ws_col;
+    return 80;
+}
+static int term_rows() {
+    struct winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+        return ws.ws_row;
+    return 24;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+class TUI {
+public:
+    // Layout constants (rows reserved at top/bottom, outside the scroll region).
+    static constexpr int kHeaderRows = 3;  // blank + title + blank
+    static constexpr int kInputRows  = 1;  // pinned input bar
+    static constexpr int kStatusRows = 1;  // spinner / status bar
+
+    // Enter alternate screen, set scroll region, draw chrome.
+    void init(const std::string& agent, const std::string& model) {
+        (void)model;
+        cols_ = term_cols();
+        rows_ = term_rows();
+        current_agent_ = agent;
+
+        printf("\033[?1049h");   // enter alternate screen
+        printf("\033[2J");       // clear (no bg fill — avoids cursor/scroll misalignment)
+        set_scroll_region();
+        printf("\033[%d;1H", kHeaderRows + 1);  // park in scroll region
+        fflush(stdout);
+        draw_header();
+        erase_chrome_row(input_row());
+        erase_chrome_row(status_row());
+    }
+
+    void resize() {
+        cols_ = term_cols();
+        rows_ = term_rows();
+        printf("\033[2J");
+        set_scroll_region();
+        draw_header();
+        erase_chrome_row(input_row());
+        erase_chrome_row(status_row());
+        fflush(stdout);
+    }
+
+    void shutdown() {
+        printf("\033[?1049l");   // exit alternate screen (restores original terminal)
+        fflush(stdout);
+    }
+
+    // Redraw header. stats_str comes from CostTracker::format_session_stats().
+    void update(const std::string& agent, const std::string& /*model*/,
+                const std::string& stats) {
+        current_agent_ = agent;
+        current_stats_ = stats;
+        draw_header();
+    }
+
+    // Position cursor at the pinned input bar so readline reads from there.
+    // Does NOT save/restore — leaves cursor at input row for readline.
+    void begin_input() {
+        erase_chrome_row(input_row());
+        printf("\033[%d;3H", input_row());  // col 3 = 2-space left indent
+        fflush(stdout);
+    }
+
+    // After readline returns, move cursor back into the scroll region so
+    // response output scrolls correctly.
+    void begin_output() {
+        int last_scroll = rows_ - kInputRows - kStatusRows;
+        printf("\033[%d;1H", last_scroll);
+        fflush(stdout);
+    }
+
+    // Spinner + message in the status bar.
+    void set_status(const std::string& msg) {
+        printf("\0337");
+        printf("\033[%d;1H\033[2K", status_row());  // erase line
+        printf("\033[38;5;240m   %.*s\033[0m",
+               cols_ - 3, msg.c_str());
+        printf("\0338");
+        fflush(stdout);
+        status_active_ = true;
+    }
+
+    void clear_status() {
+        if (!status_active_) return;
+        erase_chrome_row(status_row());
+        status_active_ = false;
+    }
+
+    int cols() const { return cols_; }
+
+private:
+    int  cols_ = 80, rows_ = 24;
+    bool status_active_ = false;
+    std::string current_agent_ = "claudius";
+    std::string current_stats_;   // from format_session_stats()
+
+    int input_row()  const { return rows_ - kStatusRows; }
+    int status_row() const { return rows_; }
+
+    void set_scroll_region() {
+        int top = kHeaderRows + 1;
+        int bot = rows_ - kInputRows - kStatusRows;
+        printf("\033[%d;%dr", top, bot);
+    }
+
+    // Erase a chrome row to a plain blank line (no background fill).
+    void erase_chrome_row(int row) {
+        printf("\0337");
+        printf("\033[%d;1H\033[2K\033[0m", row);
+        printf("\0338");
+        fflush(stdout);
+    }
+
+    void draw_header() {
+        // Three rows: blank / content / blank.
+        // Content row: "  agent  " (bold) ... "stats   " (muted grey)
+        std::string left_vis  = "  " + current_agent_ + "  ";
+        std::string right_vis = current_stats_.empty() ? "" : current_stats_ + "   ";
+        int pad = std::max(0, cols_ - (int)left_vis.size() - (int)right_vis.size());
+
+        printf("\0337");
+
+        // Row 1 — blank padding
+        printf("\033[1;1H\033[48;5;233m%*s", cols_, "");
+
+        // Row 2 — title + stats
+        printf("\033[2;1H\033[48;5;233m");
+        // Bold light-grey agent name
+        printf("\033[1m\033[38;5;253m  %s  \033[0m\033[48;5;233m",
+               current_agent_.c_str());
+        // Fill gap
+        printf("%*s", pad, "");
+        // Muted grey stats (no colour coding)
+        if (!right_vis.empty())
+            printf("\033[38;5;242m%s\033[0m", right_vis.c_str());
+
+        // Row 3 — blank padding
+        printf("\033[3;1H\033[48;5;233m%*s\033[0m", cols_, "");
+
+        printf("\0338");
+        fflush(stdout);
+    }
+};
+
+// ─── Turn separator ───────────────────────────────────────────────────────────
+
+// Prints a colored rule line:  ─── label ──────────────────── right_label ─
+static void print_turn_rule(const std::string& label, const std::string& color,
+                             const std::string& right_label, int cols) {
+    const char* dim = "\033[38;5;238m";
+    const char* rst = "\033[0m";
+
+    // Visible widths: "─── " + label + " " + fill + right_label + " ─"
+    // but right_label may be empty.
+    int prefix = 4;  // "─── "
+    int suffix = right_label.empty() ? 0 : (int)right_label.size() + 2;  // " right ─" → +2
+    int label_w = (int)label.size() + 2;  // " label " padded on both sides
+    int fill = std::max(0, cols - prefix - label_w - suffix);
+
+    std::string line;
+    line += dim;
+    line += "───";
+    line += color;
+    line += " ";
+    line += label;
+    line += " ";
+    line += dim;
+    for (int i = 0; i < fill; ++i) line += "─";
+    if (!right_label.empty()) {
+        line += "\033[38;5;241m ";
+        line += right_label;
+        line += dim;
+        line += " ─";
+    }
+    line += rst;
+    line += "\n";
+    std::cout << line;
+}
+
+// ─── Thinking indicator ───────────────────────────────────────────────────────
+
 class ThinkingIndicator {
 public:
-    void start() {
+    explicit ThinkingIndicator(TUI* tui = nullptr) : tui_(tui) {}
+
+    void start(const std::string& label = "thinking") {
+        label_ = label;
         running_ = true;
         thread_ = std::thread([this]() {
-            static const char* frames[] = {"   ", ".  ", ".. ", "..."};
+            static const char* dots[] = {"", " .", " ..", " ..."};
             int i = 0;
             while (running_.load()) {
-                std::cout << "\rthinking" << frames[i % 4] << std::flush;
+                if (tui_) tui_->set_status(label_ + dots[i % 4]);
                 ++i;
                 std::this_thread::sleep_for(std::chrono::milliseconds(400));
             }
-            std::cout << "\r            \r" << std::flush;
+            if (tui_) tui_->clear_status();
         });
     }
 
@@ -340,8 +538,10 @@ public:
     }
 
 private:
+    TUI*             tui_ = nullptr;
+    std::string      label_;
     std::atomic<bool> running_{false};
-    std::thread thread_;
+    std::thread      thread_;
 };
 
 // Shared output lock: prevents loop thread output from interleaving with
@@ -736,11 +936,46 @@ static void cmd_interactive() {
     orch.set_memory_dir(get_memory_dir());
     orch.load_agents(dir + "/agents");
 
-    std::cout << BANNER;
-    std::cout << "Use /help for list of commands.\n\n";
-
     std::string current_agent = "claudius";
-    ThinkingIndicator thinking;
+    std::string current_model = orch.get_agent_model(current_agent);
+
+    // Init TUI before any output (clears screen, sets scroll region, draws header).
+    TUI tui;
+    tui.init(current_agent, current_model);
+
+    // Minimal welcome — banner would clutter the clean scroll area.
+    std::cout << "\n  /help for commands\n\n";
+    std::cout.flush();
+
+    signal(SIGWINCH, sigwinch_handler);
+
+    // Wire sub-agent progress: print each sub-agent turn dimmed and indented.
+    // Called from within the locked send_streaming path — do NOT re-acquire g_out_mu.
+    orch.set_progress_callback([&tui](const std::string& agent_id,
+                                      const std::string& content) {
+        // Sub-agent rule: same style as turn rules but dimmer (no agent palette color).
+        const char* dim_rule = "\033[38;5;238m";
+        const char* rst      = "\033[0m";
+        int cols = tui.cols();
+
+        // ─── agent_id (sub) ────────────────────────────────────
+        std::string label = agent_id + " (sub)";
+        int fill = std::max(0, cols - 4 - (int)label.size() - 2);
+        std::string rule = std::string(dim_rule) + "── " + label + " ";
+        for (int i = 0; i < fill; ++i) rule += "─";
+        rule += rst;
+        std::cout << "\n" << rule << "\n";
+
+        // Content: dimmed, each line indented
+        std::istringstream ss(content);
+        std::string line;
+        while (std::getline(ss, line)) {
+            std::cout << dim_rule << "  " << line << rst << "\n";
+        }
+        std::cout.flush();
+    });
+
+    ThinkingIndicator thinking(&tui);
     LoopManager loops;
     claudius::ReadlineWrapper rl;
     claudius::CostTracker tracker;
@@ -800,16 +1035,18 @@ static void cmd_interactive() {
         });
 
     while (true) {
-        std::string prompt =
-            agent_color(current_agent)
-            + "[" + current_agent + "]"
-            + "\033[0m > ";
+        // Handle terminal resize between inputs
+        if (g_winch) { g_winch = 0; tui.resize(); }
+
+        tui.begin_input();
+        std::string prompt = "\033[38;5;241m>\033[0m ";
 
         std::string line;
         if (!rl.read_line(prompt, line)) {
             std::cout << "\n";
             break;
         }
+        tui.begin_output();  // reposition cursor in scroll region before any output
         if (line.empty()) continue;
 
         // Intercept bare exit/quit commands (no slash required)
@@ -861,7 +1098,8 @@ static void cmd_interactive() {
                 iss >> id;
                 if (id == "claudius" || orch.has_agent(id)) {
                     current_agent = id;
-                    std::cout << "Switched to: " << id << "\n";
+                    current_model = orch.get_agent_model(id);
+                    tui.update(current_agent, current_model, tracker.format_session_stats());
                 } else {
                     std::cout << "ERR: no agent '" << id << "'\n";
                 }
@@ -876,6 +1114,8 @@ static void cmd_interactive() {
                 try {
                     claudius::MarkdownRenderer md;
                     std::lock_guard<std::mutex> out(g_out_mu);
+                    tui.begin_output();
+                    print_turn_rule(id, agent_color(id), "", tui.cols());
                     auto resp = orch.send_streaming(id, msg,
                         [&md](const std::string& chunk) {
                             auto s = md.feed(chunk);
@@ -886,12 +1126,15 @@ static void cmd_interactive() {
                     std::cout << "\n";
                     if (resp.ok) {
                         tracker.record(id, orch.get_agent_model(id), resp);
-                        std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model(id)) << "\n";
+                        std::cout << "\033[38;5;238m  "
+                                  << tracker.format_footer(resp, orch.get_agent_model(id))
+                                  << "\033[0m\n";
+                        tui.update(current_agent, current_model, tracker.format_session_stats());
                     } else {
-                        std::cout << "ERR: " << resp.error << "\n";
+                        std::cout << "\033[38;5;167mERR: " << resp.error << "\033[0m\n";
                     }
                 } catch (const std::exception& e) {
-                    std::cout << "ERR: " << e.what() << "\n";
+                    std::cout << "\033[38;5;167mERR: " << e.what() << "\033[0m\n";
                 }
                 continue;
             }
@@ -902,6 +1145,8 @@ static void cmd_interactive() {
                 try {
                     claudius::MarkdownRenderer md;
                     std::lock_guard<std::mutex> out(g_out_mu);
+                    tui.begin_output();
+                    print_turn_rule("claudius", agent_color("claudius"), "", tui.cols());
                     auto resp = orch.send_streaming("claudius", query,
                         [&md](const std::string& chunk) {
                             auto s = md.feed(chunk);
@@ -912,12 +1157,15 @@ static void cmd_interactive() {
                     std::cout << "\n";
                     if (resp.ok) {
                         tracker.record("claudius", orch.get_agent_model("claudius"), resp);
-                        std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model("claudius")) << "\n";
+                        std::cout << "\033[38;5;238m  "
+                                  << tracker.format_footer(resp, orch.get_agent_model("claudius"))
+                                  << "\033[0m\n";
+                        tui.update(current_agent, current_model, tracker.format_session_stats());
                     } else {
-                        std::cout << "ERR: " << resp.error << "\n";
+                        std::cout << "\033[38;5;167mERR: " << resp.error << "\033[0m\n";
                     }
                 } catch (const std::exception& e) {
-                    std::cout << "ERR: " << e.what() << "\n";
+                    std::cout << "\033[38;5;167mERR: " << e.what() << "\033[0m\n";
                 }
                 continue;
             }
@@ -1089,36 +1337,40 @@ static void cmd_interactive() {
                     std::cout << "Usage: /fetch <url>\n";
                     continue;
                 }
-                std::cout << "fetching " << url << "...\n";
+                thinking.start("fetching");
                 std::string content = fetch_url(url);
+                thinking.stop();
                 if (content.substr(0, 4) == "ERR:") {
-                    std::cout << content << "\n";
+                    std::cout << "\033[38;5;167m" << content << "\033[0m\n";
                     continue;
                 }
-                // Cap at 32 KB to avoid bloating the agent's context window
                 static constexpr size_t kFetchLimit = 32768;
                 if (content.size() > kFetchLimit) {
                     content.resize(kFetchLimit);
                     content += "\n... [content truncated to 32 KB]";
                 }
-                // Inject into current agent as a user message
                 std::string msg = "[FETCHED: " + url + "]\n" + content +
                                   "\n[END FETCHED]\n";
                 try {
-                    thinking.start();
+                    thinking.start("generating");
                     auto resp = orch.send(current_agent, msg);
                     thinking.stop();
                     std::lock_guard<std::mutex> out(g_out_mu);
+                    tui.begin_output();
+                    print_turn_rule(current_agent, agent_color(current_agent), "", tui.cols());
                     if (resp.ok) {
                         std::cout << claudius::render_markdown(resp.content) << "\n";
                         tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
-                        std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model(current_agent)) << "\n";
+                        std::cout << "\033[38;5;238m  "
+                                  << tracker.format_footer(resp, orch.get_agent_model(current_agent))
+                                  << "\033[0m\n";
+                        tui.update(current_agent, current_model, tracker.format_session_stats());
                     } else {
-                        std::cout << "ERR: " << resp.error << "\n";
+                        std::cout << "\033[38;5;167mERR: " << resp.error << "\033[0m\n";
                     }
                 } catch (const std::exception& ex) {
                     thinking.stop();
-                    std::cout << "ERR: " << ex.what() << "\n";
+                    std::cout << "\033[38;5;167mERR: " << ex.what() << "\033[0m\n";
                 }
                 continue;
             }
@@ -1233,6 +1485,8 @@ static void cmd_interactive() {
         try {
             claudius::MarkdownRenderer md;
             std::lock_guard<std::mutex> out(g_out_mu);
+            tui.begin_output();
+            print_turn_rule(current_agent, agent_color(current_agent), "", tui.cols());
             auto resp = orch.send_streaming(current_agent, line,
                 [&md](const std::string& chunk) {
                     auto s = md.feed(chunk);
@@ -1243,21 +1497,26 @@ static void cmd_interactive() {
             std::cout << "\n";
             if (resp.ok) {
                 tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
-                std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model(current_agent)) << "\n";
+                std::cout << "\033[38;5;238m  "
+                          << tracker.format_footer(resp, orch.get_agent_model(current_agent))
+                          << "\033[0m\n";
+                char buf[16];
+                snprintf(buf, sizeof(buf), "$%.4f", tracker.session_cost());
+                tui.update(current_agent, current_model, buf);
             } else {
-                std::cout << "ERR: " << resp.error << "\n";
+                std::cout << "\033[38;5;167mERR: " << resp.error << "\033[0m\n";
             }
         } catch (const std::exception& e) {
-            std::cout << "ERR: " << e.what() << "\n";
+            std::cout << "\033[38;5;167mERR: " << e.what() << "\033[0m\n";
         }
     }
 
-    // Session summary on exit
+    // Restore terminal and print session summary
+    tui.shutdown();
     std::cout << "\n";
     if (tracker.session_cost() > 0.0) {
         std::cout << tracker.format_summary();
     }
-    std::cout << orch.global_status();
 }
 
 static void cmd_oneshot(const std::string& agent_id, const std::string& msg) {

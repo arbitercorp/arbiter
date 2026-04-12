@@ -43,10 +43,16 @@ public:
     // Session total cost accumulated across all agents.
     double session_cost() const;
 
+    // Compact session-level stats for the TUI header.
+    // e.g. "in:12,681 out:2,085 | $0.02 | session:$0.04"
+    std::string format_session_stats() const;
+
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentCostRecord> agents_;
-    double session_total_ = 0.0;
+    double session_total_  = 0.0;
+    int    session_input_  = 0;
+    int    session_output_ = 0;
 
     static double compute_cost(const std::string& model, const ApiResponse& resp);
     static const ModelPricing& pricing_for(const std::string& model);

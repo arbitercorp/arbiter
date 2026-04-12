@@ -19,6 +19,13 @@ public:
     // Set directory used for agent memory files (default: ~/.claudius/memory).
     void set_memory_dir(const std::string& dir) { memory_dir_ = dir; }
 
+    // Optional callback fired after each sub-agent turn (depth > 0).
+    // Called on the same thread as send()/send_streaming(), with any output
+    // lock already held by the caller — do NOT re-acquire g_out_mu inside it.
+    using ProgressCallback = std::function<void(const std::string& agent_id,
+                                                 const std::string& content)>;
+    void set_progress_callback(ProgressCallback cb);
+
     // Agent management
     Agent& create_agent(const std::string& id, Constitution config);
     Agent& get_agent(const std::string& id);
@@ -41,7 +48,7 @@ public:
                                const std::string& message,
                                StreamCallback cb);
 
-    // Ask Claudius (master) about system state
+    // Ask Claudius (master) about system state — used by the TCP server.
     ApiResponse ask_claudius(const std::string& query);
 
     // Return the model string for a given agent (or master if id == "claudius")
@@ -61,6 +68,7 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Agent>> agents_;
     mutable std::mutex agents_mutex_;
     std::string memory_dir_;
+    ProgressCallback progress_cb_;
 
     // Master Claudius agent for meta-queries
     std::unique_ptr<Agent> claudius_master_;

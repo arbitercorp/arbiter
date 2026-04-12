@@ -102,6 +102,14 @@ AgentInvoker Orchestrator::make_invoker(const std::string& caller_id, int depth)
     };
 }
 
+ApiResponse Orchestrator::ask_claudius(const std::string& query) {
+    return send("claudius", query);
+}
+
+void Orchestrator::set_progress_callback(ProgressCallback cb) {
+    progress_cb_ = std::move(cb);
+}
+
 // Core agentic dispatch loop — used by both send() and sub-agent invocations.
 ApiResponse Orchestrator::send_internal(const std::string& agent_id,
                                         const std::string& message,
@@ -124,6 +132,12 @@ ApiResponse Orchestrator::send_internal(const std::string& agent_id,
     for (int i = 0; i < kMaxTurns; ++i) {
         resp = agent_ptr->send(current_msg);
         if (!resp.ok) return resp;
+
+        // Notify the UI about sub-agent turns (depth > 0) so the user can
+        // watch orchestration unfold in real time.
+        if (depth > 0 && resp.ok && progress_cb_) {
+            progress_cb_(agent_id, resp.content);
+        }
 
         auto cmds = parse_agent_commands(resp.content);
         if (cmds.empty()) break;
@@ -178,9 +192,6 @@ ApiResponse Orchestrator::send_streaming(const std::string& agent_id,
     return resp;
 }
 
-ApiResponse Orchestrator::ask_claudius(const std::string& query) {
-    return send("claudius", query);
-}
 
 std::string Orchestrator::get_agent_model(const std::string& id) const {
     if (id == "claudius") return claudius_master_->config().model;

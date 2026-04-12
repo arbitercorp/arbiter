@@ -10,7 +10,7 @@
 
 ![Claudius Demo](./content/claudius.gif)
 
-**Lightweight C++ agent orchestrator for the Claude API.**
+**A lightweight, general-purpose agent orchestration runtime for the Claude API.**
 
 - Talks to the Claude API over raw TLS (no libcurl, no HTTP library)
 - Enforces a master constitution — formal, terse, token-efficient (derived from [JuliusBrussee/caveman](https://github.com/JuliusBrussee/caveman)) — cutting ~75% of output tokens

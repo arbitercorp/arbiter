@@ -3,7 +3,6 @@
 #include "cost_tracker.h"
 #include <sstream>
 #include <iomanip>
-#include <algorithm>
 
 namespace claudius {
 
@@ -77,6 +76,8 @@ void CostTracker::record(const std::string& agent_id,
     rec.total_requests++;
     rec.total_cost         += cost;
     session_total_         += cost;
+    session_input_         += resp.input_tokens;
+    session_output_        += resp.output_tokens;
 }
 
 std::string CostTracker::format_footer(const ApiResponse& resp,
@@ -147,6 +148,17 @@ std::string CostTracker::format_summary() const {
 double CostTracker::session_cost() const {
     std::lock_guard<std::mutex> lk(mu_);
     return session_total_;
+}
+
+std::string CostTracker::format_session_stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (session_input_ == 0 && session_output_ == 0)
+        return "";
+    std::ostringstream ss;
+    ss << "in:" << fmt_int(session_input_)
+       << " out:" << fmt_int(session_output_)
+       << " | " << fmt_dollars(session_total_);
+    return ss.str();
 }
 
 } // namespace claudius

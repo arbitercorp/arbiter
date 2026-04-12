@@ -145,6 +145,21 @@ std::string MarkdownRenderer::process_line(const std::string& line) {
     // Empty line
     if (line.empty()) return line;
 
+    // Agent-issued command lines (/fetch, /exec, /agent, /write, /mem, /endwrite).
+    // Rendered in dim amber with a right-arrow prefix so they are clearly
+    // system actions, not user input or prose.
+    if (!line.empty() && line[0] == '/') {
+        static const char* kCmdPrefixes[] = {
+            "/fetch ", "/exec ", "/agent ", "/write ", "/mem ", "/endwrite", nullptr
+        };
+        for (auto** p = kCmdPrefixes; *p; ++p) {
+            size_t plen = strlen(*p);
+            if (line.size() >= plen && line.substr(0, plen) == *p) {
+                return fg(172) + std::string(DIM) + "  ❯ " + line + RST;
+            }
+        }
+    }
+
     // Headings: # ## ### ####
     if (line[0] == '#') {
         size_t lvl = 0;
