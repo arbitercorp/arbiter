@@ -113,18 +113,6 @@ Memory is stored per-agent at `~/.claudius/memory/<agent-id>.md`.
 | `devops` | Infrastructure engineer | Shell, git, Docker, CI/CD |
 | `planner` | Task planner | Produces structured plan files with phase/dependency breakdown |
 
-### Delegation
-
-When you send a message to claudius, it reads the available agents and routes accordingly:
-
-- Research, URLs, competitive analysis → `researcher`
-- Code review, defect analysis → `reviewer`
-- Essays, READMEs, docs, PRDs → `writer`
-- Shell, git, Docker, CI/CD → `devops`
-- Complex multi-step tasks → `planner`, then execute phases
-
-Sub-agents have full tool access (`/fetch`, `/exec`, `/write`, `/agent`). Delegation depth is capped at 2 (claudius → agent → sub-agent). Sub-agent token costs are tracked correctly in the session total.
-
 ### Constitution format
 
 Each agent is defined by a JSON file in `~/.claudius/agents/`:
