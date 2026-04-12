@@ -8,6 +8,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/tylerreckart/claudius?style=flat" alt="License"></a>
 </p>
 
+![Claudius Demo](./content/claudius.gif)
+
 **Lightweight C++ agent orchestrator for the Claude API.**
 
 - Talks to the Claude API over raw TLS (no libcurl, no HTTP library)
