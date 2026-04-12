@@ -1,22 +1,11 @@
-**Warning**
-> Claudius is under active development and should be considered unstable. Interfaces, agent constitution formats, and runtime behavior are subject to breaking changes. No stability guarantees are made at this time.  
-
-<p align="center" style="font-size: 48px;">
-  🏛️
-</p>
-
 <h1 align="center">Claudius</h1>
 
 <p align="center">
-  <strong>Lean agent orchestration runtime</strong>
+  <strong>Lean agent orchestration runtime for Claude</strong>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/tylerreckart/claudius?style=flat" alt="License"></a>
-</p>
-
-<p align="center">
-  <img src="content/claudius.gif" alt="Claudius demo">
 </p>
 
 **Lightweight C++ agent orchestrator for the Claude API.**
@@ -46,16 +35,6 @@ claudius --init
 claudius
 ```
 
-### From source
-
-```bash
-git clone https://github.com/tylerreckart/claudius.git
-cd claudius
-./install.sh
-```
-
-The install script handles dependencies (`brew bundle` on macOS, `apt`/`dnf` on Linux), builds a release binary, installs `claudius` and `claudius-cli` to `/usr/local/bin`, and runs `claudius --init` on first install.
-
 ### Manual build
 
 #### macOS
@@ -76,13 +55,6 @@ mkdir build && cd build
 cmake ..
 make -j$(nproc)
 sudo cp claudius /usr/local/bin/
-```
-
-#### Debug build with AddressSanitizer
-
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Debug -DCLAUDIUS_ASAN=ON
-make -j$(nproc)
 ```
 
 ## Quick Start

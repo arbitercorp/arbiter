@@ -78,30 +78,34 @@ void Orchestrator::load_agents(const std::string& dir) {
     }
 }
 
-// Build an AgentInvoker that delegates to a named sub-agent.
-// caller_id is excluded to prevent direct self-recursion.
-AgentInvoker Orchestrator::make_invoker(const std::string& caller_id) {
-    return [this, caller_id](const std::string& sub_id, const std::string& sub_msg) -> std::string {
+// Build an AgentInvoker that runs a sub-agent through the full dispatch loop.
+// Sub-agents receive their own tool access (/fetch, /exec, /write, /agent).
+// depth prevents runaway delegation chains (max 2 levels: claudius → agent → sub-agent).
+AgentInvoker Orchestrator::make_invoker(const std::string& caller_id, int depth) {
+    if (depth >= 2) {
+        return [](const std::string&, const std::string&) -> std::string {
+            return "ERR: delegation depth limit reached (max 2 levels)";
+        };
+    }
+    return [this, caller_id, depth](const std::string& sub_id, const std::string& sub_msg) -> std::string {
         if (sub_id == caller_id) return "ERR: agent cannot invoke itself";
-        if (sub_id == "claudius") return "ERR: recursive claudius invocation not permitted";
-
-        // Get pointer while holding the lock, then release before calling send
-        Agent* sub = nullptr;
+        if (sub_id == "claudius") return "ERR: claudius cannot be delegated to";
         {
             std::lock_guard<std::mutex> lk(agents_mutex_);
-            auto it = agents_.find(sub_id);
-            if (it == agents_.end())
+            if (!agents_.count(sub_id))
                 return "ERR: no agent '" + sub_id + "'";
-            sub = it->second.get();
         }
-
-        auto sub_resp = sub->send(sub_msg);
-        return sub_resp.ok ? sub_resp.content : "ERR: " + sub_resp.error;
+        // Run the full agentic dispatch loop for the sub-agent so it has
+        // access to its own tools (/fetch, /exec, /write, /agent, /mem).
+        auto resp = send_internal(sub_id, sub_msg, depth + 1);
+        return resp.ok ? resp.content : "ERR: " + resp.error;
     };
 }
 
-ApiResponse Orchestrator::send(const std::string& agent_id, const std::string& message) {
-    // Resolve agent pointer and build the first message.
+// Core agentic dispatch loop — used by both send() and sub-agent invocations.
+ApiResponse Orchestrator::send_internal(const std::string& agent_id,
+                                        const std::string& message,
+                                        int depth) {
     Agent* agent_ptr;
     std::string current_msg;
 
@@ -113,12 +117,11 @@ ApiResponse Orchestrator::send(const std::string& agent_id, const std::string& m
         current_msg = message;
     }
 
-    auto invoker = make_invoker(agent_id);
+    auto invoker = make_invoker(agent_id, depth);
 
-    // Agentic dispatch loop: execute commands emitted by the agent and feed
-    // results back, up to 6 turns.
     ApiResponse resp;
-    for (int i = 0; i < 6; ++i) {
+    static constexpr int kMaxTurns = 6;
+    for (int i = 0; i < kMaxTurns; ++i) {
         resp = agent_ptr->send(current_msg);
         if (!resp.ok) return resp;
 
@@ -130,6 +133,10 @@ ApiResponse Orchestrator::send(const std::string& agent_id, const std::string& m
     }
 
     return resp;
+}
+
+ApiResponse Orchestrator::send(const std::string& agent_id, const std::string& message) {
+    return send_internal(agent_id, message, 0);
 }
 
 ApiResponse Orchestrator::send_streaming(const std::string& agent_id,
@@ -153,12 +160,13 @@ ApiResponse Orchestrator::send_streaming(const std::string& agent_id,
     auto cmds = parse_agent_commands(resp.content);
     if (cmds.empty()) return resp;
 
-    auto invoker = make_invoker(agent_id);
+    auto invoker = make_invoker(agent_id, 0);
 
     // Tool-call re-entry turns: stream each so the user can follow progress
     resp.had_tool_calls = true;
-    for (int i = 0; i < 5; ++i) {
-        cb("\n");  // end the previous streamed line before tool output
+    static constexpr int kMaxReentryTurns = 5;
+    for (int i = 0; i < kMaxReentryTurns; ++i) {
+        cb("\n");
         current_msg = execute_agent_commands(cmds, agent_id, memory_dir_, invoker);
         resp = agent_ptr->stream(current_msg, cb);
         if (!resp.ok) return resp;
@@ -185,13 +193,35 @@ std::string Orchestrator::get_agent_model(const std::string& id) const {
 std::string Orchestrator::global_status() const {
     std::lock_guard<std::mutex> lock(agents_mutex_);
     std::ostringstream ss;
-    ss << "SYSTEM STATUS\n";
-    ss << "agents:" << agents_.size()
-       << " | total_in:" << client_.total_input_tokens()
-       << " total_out:" << client_.total_output_tokens() << "\n";
-    for (auto& [id, agent] : agents_) {
-        ss << "  " << agent->status_summary() << "\n";
+
+    // Agent roster — this is the primary signal Claudius uses for routing.
+    // Format emphasizes capability over stats; stats follow in parentheses.
+    if (agents_.empty()) {
+        ss << "AVAILABLE AGENTS: none loaded\n";
+    } else {
+        ss << "AVAILABLE AGENTS — delegate with /agent <id> <task>:\n";
+        for (auto& [id, agent] : agents_) {
+            const auto& cfg = agent->config();
+            ss << "  " << id;
+            if (!cfg.role.empty())
+                ss << "  [" << cfg.role << "]";
+            if (!cfg.goal.empty())
+                ss << "  — " << cfg.goal;
+            ss << "\n";
+            // Stats on second line, indented, so they don't crowd the capability description
+            const auto& st = agent->stats();
+            ss << "    reqs:" << st.total_requests
+               << " in:" << st.total_input_tokens
+               << " out:" << st.total_output_tokens;
+            if (!cfg.advisor_model.empty())
+                ss << " advisor:" << cfg.advisor_model;
+            ss << "\n";
+        }
     }
+
+    ss << "SESSION: in:" << client_.total_input_tokens()
+       << " out:" << client_.total_output_tokens() << "\n";
+
     return ss.str();
 }
 

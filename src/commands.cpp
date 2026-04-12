@@ -59,6 +59,32 @@ std::vector<AgentCommand> parse_agent_commands(const std::string& response) {
             cmd.name = "exec";
             cmd.args = line.substr(6);
             if (!cmd.args.empty()) result.push_back(std::move(cmd));
+
+        } else if (line.size() > 7 && line.substr(0, 7) == "/write ") {
+            // Multiline write block: /write <path>\n<content>\n/endwrite
+            AgentCommand cmd;
+            cmd.name = "write";
+            cmd.args = line.substr(7);
+            // Trim trailing whitespace from path
+            while (!cmd.args.empty() && (cmd.args.back() == ' ' || cmd.args.back() == '\r'))
+                cmd.args.pop_back();
+            if (cmd.args.empty()) continue;
+
+            // Accumulate lines until /endwrite
+            std::ostringstream body;
+            bool closed = false;
+            while (std::getline(ss, line)) {
+                // Trim CR
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line == "/endwrite") { closed = true; break; }
+                body << line << "\n";
+            }
+            // Remove trailing newline added by the loop
+            cmd.content = body.str();
+            if (!cmd.content.empty() && cmd.content.back() == '\n')
+                cmd.content.pop_back();
+            (void)closed; // content valid even if sentinel was missing (EOF)
+            result.push_back(std::move(cmd));
         }
     }
 
@@ -235,6 +261,36 @@ std::string cmd_exec(const std::string& command) {
 }
 
 // ---------------------------------------------------------------------------
+// cmd_write
+// ---------------------------------------------------------------------------
+
+std::string cmd_write(const std::string& path, const std::string& content) {
+    if (path.empty()) return "ERR: empty path";
+
+    // Basic path safety: reject obvious traversal tricks
+    if (path.find("..") != std::string::npos)
+        return "ERR: path traversal not permitted";
+
+    // Create parent directories
+    fs::path p(path);
+    if (p.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(p.parent_path(), ec);
+        if (ec) return "ERR: cannot create directories: " + ec.message();
+    }
+
+    std::ofstream f(path, std::ios::out | std::ios::trunc);
+    if (!f.is_open()) return "ERR: cannot open for writing: " + path;
+
+    f << content;
+    if (!content.empty() && content.back() != '\n') f << '\n';
+
+    if (f.fail()) return "ERR: write failed: " + path;
+
+    return "OK: wrote " + std::to_string(content.size()) + " bytes to " + path;
+}
+
+// ---------------------------------------------------------------------------
 // Memory helpers
 // ---------------------------------------------------------------------------
 
@@ -357,6 +413,11 @@ std::string execute_agent_commands(const std::vector<AgentCommand>& cmds,
                 out << "ERR: agent invocation unavailable in this context\n";
             }
             out << "[END AGENT]\n\n";
+
+        } else if (cmd.name == "write") {
+            out << "[/write " << cmd.args << "]\n";
+            out << cmd_write(cmd.args, cmd.content) << "\n";
+            out << "[END WRITE]\n\n";
         }
     }
 

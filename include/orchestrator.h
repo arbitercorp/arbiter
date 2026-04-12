@@ -65,8 +65,15 @@ private:
     // Master Claudius agent for meta-queries
     std::unique_ptr<Agent> claudius_master_;
 
-    // Build an AgentInvoker lambda for use in command dispatch
-    AgentInvoker make_invoker(const std::string& caller_id);
+    // Core dispatch loop shared by send() and sub-agent invocations.
+    // depth controls delegation nesting (max 2: claudius → agent → sub-agent).
+    ApiResponse send_internal(const std::string& agent_id,
+                              const std::string& message,
+                              int depth = 0);
+
+    // Build an AgentInvoker lambda for use in command dispatch.
+    // depth is the current nesting level; invoker refuses beyond depth 2.
+    AgentInvoker make_invoker(const std::string& caller_id, int depth = 0);
 };
 
 } // namespace claudius

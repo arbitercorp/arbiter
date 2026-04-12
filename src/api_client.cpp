@@ -43,17 +43,25 @@ bool ApiClient::ensure_connection() {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo(API_HOST, "443", &hints, &res) != 0)
+    int gai = getaddrinfo(API_HOST, "443", &hints, &res);
+    if (gai != 0) {
+        last_conn_error_ = std::string("DNS lookup failed: ") + gai_strerror(gai);
         return false;
+    }
 
     sock_ = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock_ < 0) { freeaddrinfo(res); return false; }
+    if (sock_ < 0) {
+        last_conn_error_ = std::string("socket() failed: ") + strerror(errno);
+        freeaddrinfo(res);
+        return false;
+    }
 
     // TCP_NODELAY for low latency
     int flag = 1;
     setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
     if (connect(sock_, res->ai_addr, res->ai_addrlen) != 0) {
+        last_conn_error_ = std::string("connect() failed: ") + strerror(errno);
         freeaddrinfo(res);
         close(sock_);
         sock_ = -1;
@@ -67,6 +75,10 @@ bool ApiClient::ensure_connection() {
     SSL_set_tlsext_host_name(ssl_, API_HOST);
 
     if (SSL_connect(ssl_) != 1) {
+        unsigned long err = ERR_get_error();
+        char errbuf[256];
+        ERR_error_string_n(err, errbuf, sizeof(errbuf));
+        last_conn_error_ = std::string("TLS handshake failed: ") + errbuf;
         SSL_free(ssl_);
         ssl_ = nullptr;
         close(sock_);
@@ -174,87 +186,83 @@ std::string ApiClient::send_request(const std::string& body, bool streaming, boo
     return {};  // response read separately
 }
 
-std::string ApiClient::read_response(bool streaming, StreamCallback cb) {
-    std::string raw;
-    raw.reserve(8192);
-    char buf[4096];
+// ─── HTTP response helpers ────────────────────────────────────────────────────
 
-    // Read headers first
-    std::string headers;
-    while (true) {
-        int n = SSL_read(ssl_, buf, 1);
-        if (n <= 0) break;
-        headers += buf[0];
-        if (headers.size() >= 4 &&
-            headers.substr(headers.size() - 4) == "\r\n\r\n") break;
-    }
+// Parse HTTP status code from the first response line ("HTTP/1.1 200 OK\r\n...").
+static int parse_http_status(const std::string& headers) {
+    auto sp = headers.find(' ');
+    if (sp == std::string::npos) return 0;
+    return std::atoi(headers.c_str() + sp + 1);
+}
 
-    // Parse content-length or chunked
+// Read the full response body (handles both chunked and content-length).
+// Used to capture error bodies that aren't SSE streams.
+static std::string read_response_body(SSL* ssl, const std::string& headers) {
     bool chunked = headers.find("Transfer-Encoding: chunked") != std::string::npos;
     int content_length = -1;
     auto cl_pos = headers.find("Content-Length: ");
-    if (cl_pos != std::string::npos) {
+    if (cl_pos != std::string::npos)
         content_length = std::atoi(headers.c_str() + cl_pos + 16);
-    }
+
+    std::string body;
+    char buf[4096];
 
     if (chunked) {
-        // Read chunked encoding
         while (true) {
-            // Read chunk size line
             std::string size_line;
             while (true) {
-                int n = SSL_read(ssl_, buf, 1);
-                if (n <= 0) goto done;
+                int n = SSL_read(ssl, buf, 1);
+                if (n <= 0) goto body_done;
                 if (buf[0] == '\n') break;
                 if (buf[0] != '\r') size_line += buf[0];
             }
             int chunk_size = static_cast<int>(std::strtol(size_line.c_str(), nullptr, 16));
             if (chunk_size == 0) break;
-
-            // Read chunk data
-            int read_so_far = 0;
-            while (read_so_far < chunk_size) {
-                int to_read = std::min(chunk_size - read_so_far, (int)sizeof(buf));
-                int n = SSL_read(ssl_, buf, to_read);
-                if (n <= 0) goto done;
-                raw.append(buf, n);
-
-                if (streaming && cb) {
-                    // Parse SSE events for streaming
-                    // (simplified: extract text deltas)
-                    std::string chunk_str(buf, n);
-                    // Look for content_block_delta events
-                    size_t dpos = 0;
-                    while ((dpos = chunk_str.find("\"text\":\"", dpos)) != std::string::npos) {
-                        dpos += 8;
-                        size_t end = chunk_str.find("\"", dpos);
-                        if (end != std::string::npos) {
-                            cb(chunk_str.substr(dpos, end - dpos));
-                            dpos = end;
-                        }
-                    }
-                }
-
-                read_so_far += n;
+            int rd = 0;
+            while (rd < chunk_size) {
+                int n = SSL_read(ssl, buf, std::min(chunk_size - rd, (int)sizeof(buf)));
+                if (n <= 0) goto body_done;
+                body.append(buf, n);
+                rd += n;
             }
-            // Read trailing \r\n
-            SSL_read(ssl_, buf, 2);
+            SSL_read(ssl, buf, 2);  // trailing \r\n
         }
-        // Read trailing headers/final \r\n
-        SSL_read(ssl_, buf, 2);
     } else if (content_length > 0) {
-        int read_so_far = 0;
-        while (read_so_far < content_length) {
-            int to_read = std::min(content_length - read_so_far, (int)sizeof(buf));
-            int n = SSL_read(ssl_, buf, to_read);
+        int rd = 0;
+        while (rd < content_length) {
+            int n = SSL_read(ssl, buf, std::min(content_length - rd, (int)sizeof(buf)));
             if (n <= 0) break;
-            raw.append(buf, n);
-            read_so_far += n;
+            body.append(buf, n);
+            rd += n;
         }
     }
+body_done:
+    return body;
+}
 
-done:
-    return raw;
+std::string ApiClient::read_response(bool /*streaming*/, StreamCallback /*cb*/) {
+    std::string headers;
+    char buf[1];
+    while (true) {
+        int n = SSL_read(ssl_, buf, 1);
+        if (n <= 0) return {};
+        headers += buf[0];
+        if (headers.size() >= 4 &&
+            headers.substr(headers.size() - 4) == "\r\n\r\n") break;
+    }
+
+    // Return status + body as a combined string so complete() can detect errors.
+    // Format: first line is "HTTP_STATUS <code>\n", rest is the response body.
+    int status = parse_http_status(headers);
+    std::string body = read_response_body(ssl_, headers);
+    if (status != 200) {
+        // Wrap non-200 so parse_response sees an API error JSON.
+        // If body is already JSON with an error field, return it directly.
+        if (body.find("\"error\"") != std::string::npos) return body;
+        return "{\"error\":{\"type\":\"http_error\",\"message\":\"HTTP "
+               + std::to_string(status) + "\"}}";
+    }
+    return body;
 }
 
 ApiResponse ApiClient::parse_response(const std::string& body) {
@@ -326,7 +334,7 @@ ApiResponse ApiClient::complete(const ApiRequest& req) {
                 if (!ensure_connection()) {
                     ApiResponse r;
                     r.ok    = false;
-                    r.error = "Connection failed";
+                    r.error = last_conn_error_.empty() ? "Connection failed" : last_conn_error_;
                     return r;
                 }
                 std::string body = build_request_body(req, false);
@@ -429,6 +437,16 @@ ApiResponse ApiClient::read_streaming_response(StreamCallback cb) {
         }
     }
 
+    // Non-200 responses are JSON error bodies, not SSE streams — parse them directly.
+    int http_status = parse_http_status(headers);
+    if (http_status != 200) {
+        std::string body = read_response_body(ssl_, headers);
+        close_connection();
+        return parse_response(body.empty()
+            ? "{\"error\":{\"type\":\"http_error\",\"message\":\"HTTP " + std::to_string(http_status) + "\"}}"
+            : body);
+    }
+
     bool chunked = headers.find("Transfer-Encoding: chunked") != std::string::npos;
 
     // Line buffer for SSE event reassembly across chunk boundaries
@@ -503,7 +521,10 @@ ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
     std::lock_guard<std::mutex> lock(conn_mutex_);
     try {
         if (!ensure_connection()) {
-            ApiResponse r; r.ok = false; r.error = "Connection failed"; return r;
+            ApiResponse r;
+            r.ok    = false;
+            r.error = last_conn_error_.empty() ? "Connection failed" : last_conn_error_;
+            return r;
         }
         std::string body = build_request_body(req, true);
         send_request(body, true, !req.advisor_model.empty());

@@ -8,8 +8,9 @@
 namespace claudius {
 
 struct AgentCommand {
-    std::string name;  // "fetch", "mem"
-    std::string args;  // rest of the command line
+    std::string name;    // "fetch", "mem", "exec", "agent", "write"
+    std::string args;    // rest of the command line
+    std::string content; // multiline body (used by /write)
 };
 
 // Parse /command lines from an agent response.
@@ -22,6 +23,10 @@ std::string cmd_fetch(const std::string& url);
 // Execute a shell command. Returns stdout+stderr, or "ERR: ..." on failure.
 // Output is capped at 32 KB. Exit status appended if non-zero.
 std::string cmd_exec(const std::string& command);
+
+// Write content to a file at path (creates parent directories).
+// Returns "OK: wrote N bytes to <path>" or "ERR: ...".
+std::string cmd_write(const std::string& path, const std::string& content);
 
 // Read the agent's persistent memory file. Returns "" if none.
 std::string cmd_mem_read(const std::string& agent_id, const std::string& memory_dir);

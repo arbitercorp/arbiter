@@ -73,6 +73,7 @@ private:
     SSL* ssl_ = nullptr;
     int  sock_ = -1;
     bool connected_ = false;
+    std::string last_conn_error_;  // populated by ensure_connection() on failure
 
     std::atomic<int> total_in_{0};
     std::atomic<int> total_out_{0};

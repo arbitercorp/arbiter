@@ -39,23 +39,25 @@ namespace fs = std::filesystem;
 
 static const char* BANNER =
     "\n"
-    "Claudius                 v0.1.7\n"
+    "————————————————————————————————\n"
+    "| Claudius              v0.1.8 |\n"
+    "————————————————————————————————\n"
     "\033[38;5;208m"
-    "\n"
-    "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc\n"
-    " cccbbbccccccccccccccccccccccc \n"
-    "   cbbbbbbbbbbbbbbbbbcccc      \n"
-    "     cbbbccccccccccc           \n"
-    "     cbbbbbbbbbbbbbbbbccc      \n"
-    "     cbbbccbbbccbbbbccbbb      \n"
-    "     cbbc  bbb  bbb  cbbb      \n"
-    "     cbbc  bbb  bbb  cbbb      \n"
-    "     cbbc  bbb  bbb  cbbb      \n"
-    "      cbc  bbb  bbb  cbc       \n"
-    "            cc  cc             \n"
+    "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbc\n"
+    " cccbbbcccccccccccccccccccccc \n"
+    "   cbbbbbbbbbbbbbbbbbcccc     \n"
+    "     cbbbccccccccccc          \n"
+    "     cbbbbbbbbbbbbbbbbccc     \n"
+    "     cbbbccbbbccbbbbccbbb     \n"
+    "     cbbc  bbb  bbb  cbbb     \n"
+    "     cbbc  bbb  bbb  cbbb     \n"
+    "     cbbc  bbb  bbb  cbbb     \n"
+    "      cbc  bbb  bbb  cbc      \n"
+    "            cc  cc            \n"
     "\033[0m"
-    "\n"
-    "   nemo omnibus horis sapit    \n"
+    "————————————————————————————————\n"
+    "|   nemo omnibus horis sapit   |\n"
+    "————————————————————————————————\n"
     "\n";
 
 static std::string agent_color(const std::string& agent_id) {
@@ -225,12 +227,36 @@ static void cmd_init() {
         };
         c.save(agents_dir + "/writer.json");
     }
+    {
+        claudius::Constitution c;
+        c.name        = "planner";
+        c.role        = "task-planner";
+        c.mode        = "planner";
+        c.model       = "claude-sonnet-4-6";
+        c.max_tokens  = 4096;
+        c.temperature = 0.2;
+        c.goal = "Decompose complex tasks into structured, executable plans with clear agent "
+                 "assignments, dependencies, and acceptance criteria. Always write the plan to a file.";
+        c.personality = "Systematic and precise. Inspects the environment before planning. "
+                        "Never skips steps. Assigns each phase to the right specialist.";
+        c.rules = {
+            "Inspect the environment with /exec before writing any plan that touches code or files.",
+            "Gather missing domain knowledge with /agent researcher before planning unfamiliar territory.",
+            "Write the plan to a file — default: plan.md. Never just display it.",
+            "Each phase task description must be self-contained: include end goal, output format, file path.",
+            "Mark which phases can run in parallel and which are sequential.",
+            "Include acceptance criteria for every phase — how will you know it is done?",
+            "Flag risks and unknowns explicitly. A plan with hidden assumptions is a liability.",
+        };
+        c.save(agents_dir + "/planner.json");
+    }
 
     std::cout << "Example agents created in " << agents_dir << "/\n";
     std::cout << "  reviewer.json   — code review (ultra)\n";
     std::cout << "  researcher.json — research analyst (haiku + opus advisor)\n";
     std::cout << "  devops.json     — infrastructure (full)\n";
-    std::cout << "  writer.json     — essays, docs, READMEs, creative writing\n\n";
+    std::cout << "  writer.json     — essays, docs, READMEs, creative writing\n";
+    std::cout << "  planner.json    — task decomposition, phased execution plans\n\n";
     std::cout << "Edit these or add your own. Then run: claudius\n";
 }
 
@@ -711,15 +737,7 @@ static void cmd_interactive() {
     orch.load_agents(dir + "/agents");
 
     std::cout << BANNER;
-    std::cout << "Basic Commands: /send <agent> <msg>\n";
-    std::cout << "                /ask  <query>\n";
-    std::cout << "                /use  <agent>\n";
-    std::cout << "                /list\n";
-    std::cout << "                /status\n";
-    std::cout << "                /tokens\n";
-    std::cout << "                /help\n";
-    std::cout << "                /quit\n";
-    std::cout << "\n";
+    std::cout << "Use /help for list of commands.\n\n";
 
     std::string current_agent = "claudius";
     ThinkingIndicator thinking;
