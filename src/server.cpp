@@ -105,7 +105,7 @@ static void send_line(int fd, const std::string& msg) {
 }
 
 void Server::handle_client(int client_fd) {
-    send_line(client_fd, "CLAUDIUS v0.1 — AUTH required");
+    send_line(client_fd, "claudius v0.1 — AUTH required");
     bool authenticated = false;
 
     while (running_) {
@@ -227,7 +227,7 @@ std::string Server::process_command(const std::string& line, bool& authenticated
     }
 
     if (CMD == "ASK") {
-        // ASK <query...> — ask Claudius master
+        // ASK <query...> — ask claudius master
         std::string query;
         std::getline(iss, query);
         if (!query.empty() && query[0] == ' ') query.erase(0, 1);

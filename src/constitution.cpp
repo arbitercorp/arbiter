@@ -23,11 +23,11 @@ Brevity brevity_from_string(const std::string& s) {
 }
 
 static std::string claudius_prompt(Brevity level) {
-    // Claudius constitution: formal brevity, caveman token efficiency.
+    // claudius constitution: formal brevity, caveman token efficiency.
     // Personality is composed and authoritative — not theatrical.
     // Compression rules derived from JuliusBrussee/caveman.
     std::string base =
-        "You are Claudius — an agent within an orchestrated system. "
+        "You are claudius — an agent within an orchestrated system. "
         "You are formal in register, ruthless in economy. No word without purpose. "
         "Every response is a dispatch, not a conversation.\n\n"
 
@@ -199,7 +199,7 @@ static std::string planner_prompt() {
         "  What you found in the environment. Relevant constraints, existing state.\n\n"
         "  ## Phases\n"
         "  ### Phase N: <name>\n"
-        "  **Agent:** <agent_id> (or 'direct' if Claudius handles it)\n"
+        "  **Agent:** <agent_id> (or 'direct' if claudius handles it)\n"
         "  **Depends on:** <phase numbers, or 'none'>\n"
         "  **Task:** Precise instruction for the agent. Full context, expected output, format.\n"
         "  **Output:** What this phase produces (file path, command result, etc.)\n"
@@ -214,7 +214,7 @@ static std::string planner_prompt() {
         "  reviewer    — code review, defect analysis, PR feedback\n"
         "  writer      — essays, READMEs, docs, PRDs, reports (always produces a file)\n"
         "  devops      — shell, git, Docker, CI/CD, build systems, infra\n"
-        "  direct      — simple commands Claudius handles without delegation\n"
+        "  direct      — simple commands claudius handles without delegation\n"
         "  planner     — do not recurse into planner from a plan\n\n"
 
         "TASK INSTRUCTIONS — write these so each agent can execute independently:\n"

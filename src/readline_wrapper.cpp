@@ -129,6 +129,18 @@ void ReadlineWrapper::redisplay() {
 #endif
 }
 
+void ReadlineWrapper::on_new_line() {
+#ifdef CLAUDIUS_HAS_READLINE
+    ::rl_on_new_line();
+#endif
+}
+
+void ReadlineWrapper::initialize() {
+#ifdef CLAUDIUS_HAS_READLINE
+    ::rl_initialize();
+#endif
+}
+
 void ReadlineWrapper::install_callback(const std::string& prompt,
                                         std::function<void(const std::string&)> on_line) {
 #ifdef CLAUDIUS_HAS_READLINE
@@ -150,6 +162,52 @@ void ReadlineWrapper::remove_callback() {
 #ifdef CLAUDIUS_HAS_READLINE
     ::rl_callback_handler_remove();
     g_line_callback = nullptr;
+#endif
+}
+
+void ReadlineWrapper::stuff_char(int c) {
+#ifdef CLAUDIUS_HAS_READLINE
+    ::rl_stuff_char(c);
+#else
+    (void)c;
+#endif
+}
+
+
+void ReadlineWrapper::set_instream(FILE* f) {
+#ifdef CLAUDIUS_HAS_READLINE
+    rl_instream = f;
+#else
+    (void)f;
+#endif
+}
+
+void ReadlineWrapper::set_getc_function(int (*fn)(FILE *)) {
+#ifdef CLAUDIUS_HAS_READLINE
+    // Capture the library default on first call so we can restore it.
+    static int (*s_original)(FILE *) = rl_getc_function;
+    rl_getc_function = fn ? fn : s_original;
+#endif
+}
+
+std::string ReadlineWrapper::current_buffer() const {
+#ifdef CLAUDIUS_HAS_READLINE
+    return rl_line_buffer ? std::string(rl_line_buffer) : "";
+#else
+    return "";
+#endif
+}
+
+int ReadlineWrapper::current_display_rows(int term_cols) const {
+    if (term_cols <= 0) return 1;
+#ifdef CLAUDIUS_HAS_READLINE
+    // The prompt is "\001ESC...\002>\001ESC...\002 " — 2 visible chars ("> ").
+    const int kPromptVisible = 2;
+    int buf_len = rl_line_buffer ? static_cast<int>(strlen(rl_line_buffer)) : 0;
+    int total = kPromptVisible + buf_len;
+    return std::max(1, (total + term_cols - 1) / term_cols);
+#else
+    return 1;
 #endif
 }
 

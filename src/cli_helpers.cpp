@@ -1,0 +1,136 @@
+// claudius/src/cli_helpers.cpp — see cli_helpers.h
+
+#include "cli_helpers.h"
+#include "commands.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <string>
+
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+namespace fs = std::filesystem;
+
+namespace claudius {
+
+const char* BANNER =
+    "                   iiii              iiii                   \n"
+    "                 iiiiiiii          iiiiiiii                 \n"
+    "               iiiiiiiiiiii      iiiiiiiiiiii               \n"
+    "             iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii             \n"
+    "           iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii           \n"
+    "         iiiiiiiiiiiiiiiiiii    iiiiiiiiiiiiiiiiiii         \n"
+    "       iiiiiiiiiiiiiiiiiii        iiiiiiiiiiiiiiiiiii       \n"
+    "     iiiiiiiiiiiiiiiiiii            iiiiiiiiiiiiiiiiiii     \n"
+    "   iiiiiiiiiiiiiiiiiii                 iiiiiiiiiiiiiiiiii   \n"
+    " iiiiiiiiiiiiiiiiii                      iiiiiiiiiiiiiiiiii \n"
+    "iiiiiiiiiiiiiiiii                          iiiiiiiiiiiiiiiii\n"
+    " iiiiiiiiiiiiii        iiiiiiiiiiiiii        iiiiiiiiiiiiii \n"
+    "   iiiiiiiiii         iiiiiiiiiiiiiiii         iiiiiiiiii   \n"
+    "     iiiiiii          iiiiiiiiiiiiiiii          iiiiiii     \n"
+    "      iiiii           iiiiiiiiiiiiiiii           iiiii      \n"
+    "     iiiiii           iiiiiiiiiiiiiiii           iiiiii     \n"
+    "    iiiiiiiii         iiiiiiiiiiiiiiii          iiiiiiii    \n"
+    "  iiiiiiiiiiii         iiiiiiiiiiiiii         iiiiiiiiiiii  \n"
+    "iiiiiiiiiiiiiiiii                           iiiiiiiiiiiiiiii\n"
+    "iiiiiiiiiiiiiiiiiii                      iiiiiiiiiiiiiiiiiii\n"
+    "  iiiiiiiiiiiiiiiiiii                  iiiiiiiiiiiiiiiiiii  \n"
+    "    iiiiiiiiiiiiiiiiiii              iiiiiiiiiiiiiiiiiii    \n"
+    "      iiiiiiiiiiiiiiiiiii          iiiiiiiiiiiiiiiiiii      \n"
+    "        iiiiiiiiiiiiiiiiiii      iiiiiiiiiiiiiiiiiii        \n"
+    "          iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii          \n"
+    "            iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii            \n"
+    "              iiiiiiiiiiiiii    iiiiiiiiiiiiii              \n"
+    "                iiiiiiiiii        iiiiiiiiii                \n"
+    "                  iiiiii             iiiii                  \n"
+    "\n";
+
+std::string agent_color(const std::string& agent_id) {
+    if (agent_id == "claudius") return "\033[38;5;208m";  // orange
+
+    static const int palette[] = {
+        75,   // cornflower blue
+        82,   // bright green
+        171,  // magenta
+        51,   // cyan
+        226,  // yellow
+        196,  // red
+        141,  // violet
+        214,  // dark orange
+        85,   // seafoam
+        207,  // pink
+        39,   // sky blue
+        154,  // lime
+    };
+    static const int palette_size = sizeof(palette) / sizeof(palette[0]);
+
+    size_t h = std::hash<std::string>{}(agent_id);
+    int code = palette[h % palette_size];
+
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "\033[38;5;%dm", code);
+    return buf;
+}
+
+std::string get_config_dir() {
+    const char* home = std::getenv("HOME");
+    if (!home) home = ".";
+    std::string dir = std::string(home) + "/.claudius";
+    fs::create_directories(dir);
+    return dir;
+}
+
+std::string get_memory_dir() {
+    std::string dir = get_config_dir() + "/memory";
+    fs::create_directories(dir);
+    return dir;
+}
+
+void write_memory(const std::string& agent_id, const std::string& text) {
+    claudius::cmd_mem_write(agent_id, text, get_memory_dir());
+}
+
+std::string read_memory(const std::string& agent_id) {
+    return claudius::cmd_mem_read(agent_id, get_memory_dir());
+}
+
+std::string fetch_url(const std::string& url) {
+    return claudius::cmd_fetch(url);
+}
+
+std::string get_api_key() {
+    const char* key = std::getenv("ANTHROPIC_API_KEY");
+    if (key && key[0]) return key;
+
+    std::string path = get_config_dir() + "/api_key";
+    std::ifstream f(path);
+    if (f.is_open()) {
+        std::string k;
+        std::getline(f, k);
+        if (!k.empty()) return k;
+    }
+
+    std::cerr << "ERR: Set ANTHROPIC_API_KEY or write key to ~/.claudius/api_key\n";
+    std::exit(1);
+}
+
+int term_cols() {
+    struct winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return ws.ws_col;
+    return 80;
+}
+
+int term_rows() {
+    struct winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+        return ws.ws_row;
+    return 24;
+}
+
+} // namespace claudius

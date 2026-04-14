@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claudius-cli — Remote client for Claudius server
+# claudius-cli — Remote client for claudius server
 # Usage: claudius-cli <host> <port> <token> [command...]
 #
 # Interactive:  claudius-cli myserver.local 9077 <token>

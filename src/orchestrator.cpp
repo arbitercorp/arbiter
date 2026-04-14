@@ -569,6 +569,12 @@ static std::vector<Message> messages_from_json(const JsonValue* arr) {
     return out;
 }
 
+void Orchestrator::cancel() {
+    // All agents and the master share the same ApiClient instance.
+    // One cancel() call interrupts any in-progress streaming across the board.
+    client_.cancel();
+}
+
 void Orchestrator::save_session(const std::string& path) const {
     auto root = jobj();
     auto& m = root->as_object_mut();
@@ -603,11 +609,15 @@ bool Orchestrator::load_session(const std::string& path) {
 
     try {
         auto root = json_parse(raw);
+        bool any_restored = false;
 
         // Restore claudius master
         auto cval = root->get("claudius");
         auto cmsgs = messages_from_json(cval.get());
-        if (!cmsgs.empty()) claudius_master_->set_history(std::move(cmsgs));
+        if (!cmsgs.empty()) {
+            claudius_master_->set_history(std::move(cmsgs));
+            any_restored = true;
+        }
 
         // Restore loaded agents
         auto aval = root->get("agents");
@@ -617,10 +627,13 @@ bool Orchestrator::load_session(const std::string& path) {
                 auto it = agents_.find(id);
                 if (it == agents_.end()) continue;
                 auto msgs = messages_from_json(vptr.get());
-                if (!msgs.empty()) it->second->set_history(std::move(msgs));
+                if (!msgs.empty()) {
+                    it->second->set_history(std::move(msgs));
+                    any_restored = true;
+                }
             }
         }
-        return true;
+        return any_restored;
     } catch (...) {
         return false;
     }

@@ -61,7 +61,7 @@ public:
                                const std::string& message,
                                StreamCallback cb);
 
-    // Ask Claudius (master) about system state — used by the TCP server.
+    // Ask claudius (master) about system state — used by the TCP server.
     ApiResponse ask_claudius(const std::string& query);
 
     // Return the model string for a given agent (or master if id == "claudius")
@@ -115,6 +115,11 @@ public:
 
     ApiClient& client() { return client_; }
 
+    // Interrupt any in-progress API call across the master and all agents.
+    // Thread-safe — can be called from the readline/main thread while the
+    // exec thread is blocked in a streaming read.
+    void cancel();
+
 private:
     ApiClient client_;
     std::unordered_map<std::string, std::unique_ptr<Agent>> agents_;
@@ -124,7 +129,7 @@ private:
     CostCallback       cost_cb_;
     AgentStartCallback start_cb_;
 
-    // Master Claudius agent for meta-queries
+    // Master claudius agent for meta-queries
     std::unique_ptr<Agent> claudius_master_;
 
     // Core dispatch loop shared by send() and sub-agent invocations.

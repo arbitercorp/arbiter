@@ -22,15 +22,27 @@ static std::vector<Message> inject_summary(const std::string& summary,
     return msgs;
 }
 
+static constexpr size_t kAutoCompactAt  = 20;
+static constexpr size_t kHardTrimAt     = 28;
+static constexpr int    kKeepAfterTrim  = 16;
+
 ApiResponse Agent::send(const std::string& user_message) {
+    // Auto-compact before adding the new message so the summary reflects the
+    // complete prior conversation, not a half-appended state.
+    if (history_.size() >= kAutoCompactAt) {
+        fprintf(stderr, "[%s] auto-compacting context (%zu msgs)\n",
+                id_.c_str(), history_.size());
+        compact();
+    }
+
     // Add user message to history
     history_.push_back(Message{"user", user_message});
 
-    // Trim BEFORE building the request so we never send a bloated history.
-    // Threshold: keep 8 messages; trim when we exceed 12.
-    if (history_.size() > 12) {
+    // Hard-trim safety net: if compact() was skipped (e.g. it failed) or
+    // history grew very large via tool-result injections, drop the oldest pairs.
+    if (history_.size() > kHardTrimAt) {
         size_t before = history_.size();
-        trim_history(8);
+        trim_history(kKeepAfterTrim);
         fprintf(stderr, "[%s] context trimmed: %zu → %zu messages (oldest dropped)\n",
                 id_.c_str(), before, history_.size());
     }
@@ -75,10 +87,17 @@ ApiResponse Agent::send(const std::string& user_message) {
 }
 
 ApiResponse Agent::stream(const std::string& user_message, StreamCallback cb) {
+    if (history_.size() >= kAutoCompactAt) {
+        fprintf(stderr, "[%s] auto-compacting context (%zu msgs)\n",
+                id_.c_str(), history_.size());
+        compact();
+    }
+
     history_.push_back(Message{"user", user_message});
-    if (history_.size() > 12) {
+
+    if (history_.size() > kHardTrimAt) {
         size_t before = history_.size();
-        trim_history(8);
+        trim_history(kKeepAfterTrim);
         fprintf(stderr, "[%s] context trimmed: %zu → %zu messages (oldest dropped)\n",
                 id_.c_str(), before, history_.size());
     }

@@ -24,7 +24,7 @@ struct Constitution {
     std::string model = "claude-sonnet-4-20250514";
 
     // Agent mode — selects the base system prompt.
-    // ""/"standard": compressed Claudius voice (default for all agents)
+    // ""/"standard": compressed claudius voice (default for all agents)
     // "writer": full-prose mode — disables compression, enables writing guidance
     std::string mode;
 
@@ -40,7 +40,7 @@ struct Constitution {
 
     // --- Routing signal ---
     // Tools this agent is designed to use.  Shown in the master's roster so
-    // Claudius can route based on capability rather than inferring from goal text.
+    // claudius can route based on capability rather than inferring from goal text.
     // Example: {"/fetch", "/mem"} for researcher, {"/exec", "/write"} for devops.
     std::vector<std::string> capabilities;
 

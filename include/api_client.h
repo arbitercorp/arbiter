@@ -65,6 +65,12 @@ public:
     int total_output_tokens() const { return total_out_.load(); }
     void reset_stats() { total_in_ = 0; total_out_ = 0; }
 
+    // Interrupt any in-progress streaming call.  Thread-safe.
+    // Shuts down the socket so SSL_read returns immediately, then marks the
+    // client as cancelled.  The cancel flag is cleared at the start of the
+    // next stream() or complete() call.
+    void cancel();
+
 private:
     std::string api_key_;
     SSL_CTX* ssl_ctx_ = nullptr;
@@ -75,8 +81,9 @@ private:
     bool connected_ = false;
     std::string last_conn_error_;  // populated by ensure_connection() on failure
 
-    std::atomic<int> total_in_{0};
-    std::atomic<int> total_out_{0};
+    std::atomic<int>  total_in_{0};
+    std::atomic<int>  total_out_{0};
+    std::atomic<bool> cancelled_{false};
 
     bool ensure_connection();
     void close_connection();

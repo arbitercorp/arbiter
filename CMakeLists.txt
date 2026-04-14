@@ -7,14 +7,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # --- Platform detection ---
 if(APPLE)
-    add_compile_definitions(CLAUDIUS_MACOS)
+    add_compile_definitions(claudius_MACOS)
 elseif(UNIX)
-    add_compile_definitions(CLAUDIUS_LINUX)
+    add_compile_definitions(claudius_LINUX)
 endif()
 
 # --- Sanitizer options (debug builds) ---
-option(CLAUDIUS_ASAN "Enable AddressSanitizer" OFF)
-if(CLAUDIUS_ASAN)
+option(claudius_ASAN "Enable AddressSanitizer" OFF)
+if(claudius_ASAN)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address)
 endif()
@@ -26,8 +26,16 @@ find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 # --- Source files ---
-set(CLAUDIUS_SOURCES
+set(claudius_SOURCES
     src/main.cpp
+    src/cli_helpers.cpp
+    src/repl/queues.cpp
+    src/loop_manager.cpp
+    src/title_generator.cpp
+    src/cli.cpp
+    src/tui/tui.cpp
+    src/tui/scroll_buffer.cpp
+    src/tui/line_editor.cpp
     src/api_client.cpp
     src/agent.cpp
     src/constitution.cpp
@@ -41,7 +49,7 @@ set(CLAUDIUS_SOURCES
     src/markdown.cpp
 )
 
-add_executable(claudius ${CLAUDIUS_SOURCES})
+add_executable(claudius ${claudius_SOURCES})
 
 target_include_directories(claudius PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -69,9 +77,9 @@ endif()
 
 if(EDITLINE_LIB AND EDITLINE_INCLUDE)
     message(STATUS "Found readline/libedit: ${EDITLINE_LIB}")
-    target_compile_definitions(claudius PRIVATE CLAUDIUS_HAS_READLINE)
+    target_compile_definitions(claudius PRIVATE claudius_HAS_READLINE)
     if(NOT READLINE_GNU)
-        target_compile_definitions(claudius PRIVATE CLAUDIUS_USE_EDITLINE)
+        target_compile_definitions(claudius PRIVATE claudius_USE_EDITLINE)
     endif()
     target_include_directories(claudius PRIVATE ${EDITLINE_INCLUDE})
     target_link_libraries(claudius PRIVATE ${EDITLINE_LIB})

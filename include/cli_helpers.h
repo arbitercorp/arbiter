@@ -1,0 +1,42 @@
+#pragma once
+// claudius/include/cli_helpers.h — Shared helpers for CLI entry points and the REPL.
+//
+// Covers:
+//   • BANNER — ASCII startup banner
+//   • agent_color — stable per-agent ANSI color
+//   • Config path helpers (~/.claudius, ~/.claudius/memory, API key resolution)
+//   • Thin wrappers around claudius::cmd_mem_* and cmd_fetch so the REPL
+//     doesn't have to thread memory_dir through every call site
+//   • term_cols / term_rows — terminal dimensions via TIOCGWINSZ
+
+#include <string>
+
+namespace claudius {
+
+extern const char* BANNER;
+
+// Stable ANSI color for a given agent id (hash-mapped into a fixed palette).
+// "claudius" always maps to orange.
+std::string agent_color(const std::string& agent_id);
+
+// ~/.claudius (created if missing).
+std::string get_config_dir();
+
+// ~/.claudius/memory (created if missing).
+std::string get_memory_dir();
+
+// ANTHROPIC_API_KEY env var, else ~/.claudius/api_key.
+// Prints to stderr and exits(1) if neither is set.
+std::string get_api_key();
+
+// Thin wrappers: commands.cpp's cmd_mem_*/cmd_fetch but with memory_dir
+// supplied automatically.
+void        write_memory(const std::string& agent_id, const std::string& text);
+std::string read_memory (const std::string& agent_id);
+std::string fetch_url   (const std::string& url);
+
+// Terminal dimensions (via ioctl on stdout).  Default to 80x24 on failure.
+int term_cols();
+int term_rows();
+
+} // namespace claudius

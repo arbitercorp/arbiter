@@ -10,12 +10,17 @@
 
 #include "orchestrator.h"
 #include "commands.h"
-#include "server.h"
-#include "auth.h"
 #include "constitution.h"
 #include "readline_wrapper.h"
 #include "cost_tracker.h"
 #include "markdown.h"
+#include "cli_helpers.h"
+#include "repl/queues.h"
+#include "loop_manager.h"
+#include "title_generator.h"
+#include "cli.h"
+#include "tui/tui.h"
+#include "tui/line_editor.h"
 
 #include <iostream>
 #include <string>
@@ -26,1192 +31,106 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <map>
-#include <queue>
 #include <sstream>
 #include <ctime>
 #include <cstdio>
 #include <unistd.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 
 namespace fs = std::filesystem;
 
-static const char* BANNER =
-    "\n"
-    "————————————————————————————————\n"
-    "| Claudius              v0.2.1 |\n"
-    "————————————————————————————————\n"
-    "\033[38;5;208m"
-    "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbc\n"
-    " cccbbbcccccccccccccccccccccc \n"
-    "   cbbbbbbbbbbbbbbbbbcccc     \n"
-    "     cbbbccccccccccc          \n"
-    "     cbbbbbbbbbbbbbbbbccc     \n"
-    "     cbbbccbbbccbbbbccbbb     \n"
-    "     cbbc  bbb  bbb  cbbb     \n"
-    "     cbbc  bbb  bbb  cbbb     \n"
-    "     cbbc  bbb  bbb  cbbb     \n"
-    "      cbc  bbb  bbb  cbc      \n"
-    "            cc  cc            \n"
-    "\033[0m"
-    "————————————————————————————————\n"
-    "|   nemo omnibus horis sapit   |\n"
-    "————————————————————————————————\n"
-    "\n";
+using claudius::BANNER;
+using claudius::agent_color;
+using claudius::get_config_dir;
+using claudius::get_memory_dir;
+using claudius::get_api_key;
+using claudius::write_memory;
+using claudius::read_memory;
+using claudius::fetch_url;
 
-static std::string agent_color(const std::string& agent_id) {
-    if (agent_id == "claudius") return "\033[38;5;208m";  // orange
-
-    // Palette: vivid, distinct 256-color codes
-    static const int palette[] = {
-        75,   // cornflower blue
-        82,   // bright green
-        171,  // magenta
-        51,   // cyan
-        226,  // yellow
-        196,  // red
-        141,  // violet
-        214,  // dark orange
-        85,   // seafoam
-        207,  // pink
-        39,   // sky blue
-        154,  // lime
-    };
-    static const int palette_size = sizeof(palette) / sizeof(palette[0]);
-
-    size_t h = std::hash<std::string>{}(agent_id);
-    int code = palette[h % palette_size];
-
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "\033[38;5;%dm", code);
-    return buf;
-}
-
-static std::string get_config_dir() {
-    const char* home = std::getenv("HOME");
-    if (!home) home = ".";
-    std::string dir = std::string(home) + "/.claudius";
-    fs::create_directories(dir);
-    return dir;
-}
-
-static std::string get_memory_dir() {
-    std::string dir = get_config_dir() + "/memory";
-    fs::create_directories(dir);
-    return dir;
-}
-
-// Thin wrappers so the interactive REPL can call the shared implementations.
-static void write_memory(const std::string& agent_id, const std::string& text) {
-    claudius::cmd_mem_write(agent_id, text, get_memory_dir());
-}
-static std::string read_memory(const std::string& agent_id) {
-    return claudius::cmd_mem_read(agent_id, get_memory_dir());
-}
-static std::string fetch_url(const std::string& url) {
-    return claudius::cmd_fetch(url);
-}
-
-static std::string get_api_key() {
-    // Check env first, then config file
-    const char* key = std::getenv("ANTHROPIC_API_KEY");
-    if (key && key[0]) return key;
-
-    std::string path = get_config_dir() + "/api_key";
-    std::ifstream f(path);
-    if (f.is_open()) {
-        std::string k;
-        std::getline(f, k);
-        if (!k.empty()) return k;
-    }
-
-    std::cerr << "ERR: Set ANTHROPIC_API_KEY or write key to ~/.claudius/api_key\n";
-    std::exit(1);
-}
-
-static void cmd_init() {
-    std::string dir = get_config_dir();
-    std::string agents_dir = dir + "/agents";
-    fs::create_directories(agents_dir);
-
-    // Generate initial auth token
-    claudius::Auth auth;
-    std::string token_path = dir + "/auth_tokens";
-    auth.load(token_path);
-
-    std::string token = claudius::Auth::generate_token();
-    auth.add_token(token);
-    auth.save(token_path);
-
-    std::cout << "Initialized ~/.claudius/\n";
-    std::cout << "Auth token (save this): " << token << "\n";
-    std::cout << "Tokens stored (hashed) in: " << token_path << "\n\n";
-
-    // Create example agent configs
-    {
-        claudius::Constitution c;
-        c.name = "reviewer";
-        c.role = "code-reviewer";
-        c.brevity = claudius::Brevity::Ultra;
-        c.max_tokens = 512;
-        c.temperature = 0.2;
-        c.goal = "Inspect code. Identify defects. Prescribe remedies.";
-        c.personality = "Senior engineer. Finds fault efficiently. "
-                        "Praises only what deserves it.";
-        c.rules = {
-            "Defects first, style second.",
-            "Prescribe the concrete fix, never vague counsel.",
-            "If the code is sound, say so in one sentence and move on.",
-        };
-        c.capabilities = {"/exec", "/write"};
-        c.save(agents_dir + "/reviewer.json");
-    }
-    {
-        claudius::Constitution c;
-        c.name         = "researcher";
-        c.role         = "research-analyst";
-        c.brevity      = claudius::Brevity::Lite;
-        c.model        = "claude-haiku-4-5-20251001";   // fast executor
-        c.advisor_model= "claude-opus-4-6";             // Opus advises on strategy
-        c.max_tokens   = 2048;
-        c.temperature  = 0.5;
-        c.goal = "Research topics with depth. Synthesize findings. Distinguish fact from inference.";
-        c.personality = "Meticulous, skeptical of hearsay, prefers primary sources. "
-                        "Reports with the formality of a written brief.";
-        c.rules = {
-            "Note confidence: high, medium, or low.",
-            "Separate what is known from what is inferred.",
-            "When uncertain, state it plainly.",
-            "Prefer primary sources. Verify claims with /fetch before stating them as fact.",
-        };
-        c.capabilities = {"/fetch", "/mem", "/agent"};
-        c.save(agents_dir + "/researcher.json");
-    }
-    {
-        claudius::Constitution c;
-        c.name = "devops";
-        c.role = "infrastructure-engineer";
-        c.brevity = claudius::Brevity::Full;
-        c.max_tokens = 1024;
-        c.temperature = 0.2;
-        c.goal = "Build and maintain infrastructure. Debug failures. Automate the repeatable.";
-        c.personality = "Ops veteran who has seen every manner of outage. "
-                        "Paranoid about uptime. Trusts declarative systems over manual labor.";
-        c.rules = {
-            "Consider failure modes before all else.",
-            "Prescribe monitoring and alerting for every change.",
-            "Prefer the declarative over the imperative.",
-            "If the action touches production, warn explicitly.",
-        };
-        c.capabilities = {"/exec", "/write", "/agent"};
-        c.save(agents_dir + "/devops.json");
-    }
-    {
-        claudius::Constitution c;
-        c.name        = "writer";
-        c.role        = "content-writer";
-        c.mode        = "writer";
-        c.model       = "claude-sonnet-4-6";
-        c.max_tokens  = 8192;
-        c.temperature = 0.7;
-        c.goal = "Produce polished, well-structured written content. "
-                 "Essays, documentation, READMEs, reports, creative writing — "
-                 "adapt format and tone to the task.";
-        c.personality = "Thoughtful, precise, adapts register to the work. "
-                        "Prefers showing over telling. Edits ruthlessly.";
-        c.rules = {
-            "Read the codebase or reference material before writing docs — use /exec or /fetch.",
-            "For essays: state the thesis in the opening paragraph.",
-            "For READMEs: lead with what the project does, then how to use it.",
-            "For creative writing: anchor abstract ideas in concrete, sensory detail.",
-            "Never pad with filler phrases. Every sentence must earn its place.",
-            "Offer a revision or alternative framing if the first draft may not land.",
-        };
-        c.capabilities = {"/write", "/fetch", "/exec", "/agent", "/mem shared"};
-        c.save(agents_dir + "/writer.json");
-    }
-    {
-        claudius::Constitution c;
-        c.name        = "planner";
-        c.role        = "task-planner";
-        c.mode        = "planner";
-        c.model       = "claude-sonnet-4-6";
-        c.max_tokens  = 4096;
-        c.temperature = 0.2;
-        c.goal = "Decompose complex tasks into structured, executable plans with clear agent "
-                 "assignments, dependencies, and acceptance criteria. Always write the plan to a file.";
-        c.personality = "Systematic and precise. Inspects the environment before planning. "
-                        "Never skips steps. Assigns each phase to the right specialist.";
-        c.rules = {
-            "Inspect the environment with /exec before writing any plan that touches code or files.",
-            "Gather missing domain knowledge with /agent researcher before planning unfamiliar territory.",
-            "Write the plan to a file — default: plan.md. Never just display it.",
-            "Each phase task description must be self-contained: include end goal, output format, file path.",
-            "Mark which phases can run in parallel and which are sequential.",
-            "Include acceptance criteria for every phase — how will you know it is done?",
-            "Flag risks and unknowns explicitly. A plan with hidden assumptions is a liability.",
-        };
-        c.capabilities = {"/exec", "/fetch", "/agent", "/write"};
-        c.save(agents_dir + "/planner.json");
-    }
-    {
-        claudius::Constitution c;
-        c.name        = "backend";
-        c.role        = "senior-backend-engineer";
-        c.model       = "claude-sonnet-4-6";
-        c.brevity     = claudius::Brevity::Full;
-        c.max_tokens  = 4096;
-        c.temperature = 0.2;
-        c.goal = "Design and implement backend systems. APIs, data modeling, distributed systems, "
-                 "security, reliability, and operational correctness.";
-        c.personality = "Correctness over cleverness. Failure-mode-first. "
-                        "Writes systems that are boring in the best possible way.";
-        c.rules = {
-            "Design API contracts before implementation — inputs, outputs, errors, and edge cases.",
-            "Every external call can fail. Model the failure, handle it, log it.",
-            "Idempotency: mutating endpoints must be safe to retry.",
-            "Auth and authorization are not optional — flag any endpoint missing them.",
-            "Use /exec to inspect the codebase, schema, or environment before prescribing changes.",
-            "Write migrations, config, and code to files with /write — not display-only.",
-            "Flag N+1 queries, missing indexes, and unbounded queries explicitly.",
-            "Security: no secrets in logs, no raw SQL with user input, validate at the boundary.",
-        };
-        c.capabilities = {"/exec", "/write", "/agent", "/mem shared"};
-        c.save(agents_dir + "/backend.json");
-    }
-    {
-        claudius::Constitution c;
-        c.name        = "frontend";
-        c.role        = "senior-frontend-engineer";
-        c.model       = "claude-sonnet-4-6";
-        c.brevity     = claudius::Brevity::Full;
-        c.max_tokens  = 4096;
-        c.temperature = 0.2;
-        c.goal = "Architect and implement frontend systems. Component design, state management, "
-                 "performance, accessibility, and cross-browser correctness.";
-        c.personality = "Component-architecture obsessed. Measures paint and bundle size. "
-                        "Treats accessibility as a correctness constraint, not an afterthought.";
-        c.rules = {
-            "TypeScript by default. Avoid any-casting; model types correctly.",
-            "Semantic HTML first — ARIA only where native elements fall short.",
-            "WCAG 2.1 AA compliance is non-negotiable. Flag violations explicitly.",
-            "State colocation: keep state as local as possible; lift only when required.",
-            "No premature abstraction — three similar components before extracting a shared one.",
-            "Performance: flag layout thrash, expensive re-renders, and unguarded network waterfalls.",
-            "Use /exec to read the codebase before prescribing structural changes.",
-            "Write code changes to files with /write — do not display-only.",
-        };
-        c.capabilities = {"/exec", "/write", "/agent", "/mem shared"};
-        c.save(agents_dir + "/frontend.json");
-    }
-    {
-        claudius::Constitution c;
-        c.name        = "marketer";
-        c.role        = "marketing-strategist";
-        c.mode        = "writer";
-        c.model       = "claude-sonnet-4-6";
-        c.brevity     = claudius::Brevity::Full;
-        c.max_tokens  = 4096;
-        c.temperature = 0.6;
-        c.goal = "Develop marketing strategy, positioning, messaging, and campaign concepts. "
-                 "Translate product capabilities into audience value. Drive acquisition and retention.";
-        c.personality = "Audience-first thinker. Measures everything. Allergic to jargon that "
-                        "doesn't convert. Knows the difference between a feature and a benefit.";
-        c.rules = {
-            "Define the target audience and their pain before anything else.",
-            "Lead with value, not features. Benefits, not specs.",
-            "Every claim needs evidence or should be framed as a hypothesis.",
-            "Use /agent researcher to validate market data before building strategy on it.",
-            "Tailor tone and channel to the audience segment — B2B copy is not B2C copy.",
-            "Produce deliverables as files via /write — briefs, copy, strategy docs.",
-            "Include success metrics for every campaign or strategy you propose.",
-        };
-        c.capabilities = {"/write", "/fetch", "/agent"};
-        c.save(agents_dir + "/marketer.json");
-    }
-    {
-        claudius::Constitution c;
-        c.name        = "social";
-        c.role        = "social-media-strategist";
-        c.mode        = "writer";
-        c.model       = "claude-sonnet-4-6";
-        c.brevity     = claudius::Brevity::Full;
-        c.max_tokens  = 4096;
-        c.temperature = 0.7;
-        c.goal = "Create platform-native content, growth strategies, and engagement campaigns. "
-                 "Adapt voice and format to each platform's grammar and audience expectations.";
-        c.personality = "Trend-literate, voice-adaptive, hook-obsessed. Thinks in threads, "
-                        "carousels, and shorts. Never writes a caption that buries the lead.";
-        c.rules = {
-            "Write for the platform: Twitter/X is punchy, LinkedIn is considered, Instagram is visual-first.",
-            "Hook within the first line — if it doesn't stop the scroll, rewrite it.",
-            "Short-form: one idea per post. Long-form: one thesis per thread.",
-            "Hashtags are discovery tools, not decoration — use them purposefully or not at all.",
-            "Include posting cadence and format guidance alongside copy.",
-            "Use /agent researcher to verify trends or audience data before building on them.",
-            "Produce content calendars and copy as files via /write.",
-        };
-        c.capabilities = {"/write", "/fetch", "/agent"};
-        c.save(agents_dir + "/social.json");
-    }
-
-    std::cout << "Example agents created in " << agents_dir << "/\n";
-    std::cout << "  reviewer.json   — code review (ultra)\n";
-    std::cout << "  researcher.json — research analyst (haiku + opus advisor)\n";
-    std::cout << "  devops.json     — infrastructure (full)\n";
-    std::cout << "  writer.json     — essays, docs, READMEs, creative writing\n";
-    std::cout << "  planner.json    — task decomposition, phased execution plans\n";
-    std::cout << "  backend.json    — APIs, data modeling, distributed systems\n";
-    std::cout << "  frontend.json   — components, state, accessibility, performance\n";
-    std::cout << "  marketer.json   — strategy, positioning, campaign concepts\n";
-    std::cout << "  social.json     — platform-native content, growth, engagement\n\n";
-    std::cout << "Edit these or add your own. Then run: claudius\n";
-}
-
-static void cmd_gen_token() {
-    std::string dir = get_config_dir();
-    std::string token_path = dir + "/auth_tokens";
-
-    claudius::Auth auth;
-    auth.load(token_path);
-
-    std::string token = claudius::Auth::generate_token();
-    auth.add_token(token);
-    auth.save(token_path);
-
-    std::cout << "New token: " << token << "\n";
-    std::cout << "Total active tokens: " << auth.token_count() << "\n";
-}
-
-static volatile sig_atomic_t g_running = 1;
-static void signal_handler(int) { g_running = 0; }
-
-static void cmd_serve(int port) {
-    std::string dir = get_config_dir();
-    std::string api_key = get_api_key();
-
-    claudius::Orchestrator orch(api_key);
-    orch.set_memory_dir(get_memory_dir());
-    orch.load_agents(dir + "/agents");
-
-    claudius::Auth auth;
-    auth.load(dir + "/auth_tokens");
-
-    if (auth.token_count() == 0) {
-        std::cerr << "WARN: No auth tokens. Run: claudius --init\n";
-    }
-
-    claudius::Server server(orch, auth, port);
-
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
-    std::cout << BANNER;
-    std::cout << "Server listening on port " << port << "\n";
-    std::cout << "Agents loaded: " << orch.list_agents().size() << "\n";
-    for (auto& id : orch.list_agents()) {
-        std::cout << "  - " << id << "\n";
-    }
-    std::cout << "\nConnect: nc <host> " << port << "\n";
-    std::cout << "Then: AUTH <token>\n\n";
-
-    server.start();
-
-    while (g_running && server.running()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
-    std::cout << "\nShutting down...\n";
-    server.stop();
-    std::cout << "Final stats: " << orch.global_status() << "\n";
-}
 
 // ─── Terminal / TUI ──────────────────────────────────────────────────────────
 
 static volatile sig_atomic_t g_winch = 0;
 static void sigwinch_handler(int) { g_winch = 1; }
 
-static int term_cols() {
-    struct winsize ws{};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
-        return ws.ws_col;
-    return 80;
+
+using claudius::TUI;
+using claudius::ThinkingIndicator;
+using claudius::CommandQueue;
+using claudius::OutputQueue;
+using claudius::LoopManager;
+
+// ─── Filtered getc — the one character-source hook that works in both ────────
+// GNU readline and libedit.  Every character readline reads goes through here,
+// giving us a clean place to:
+//   • drain async exec output to the TUI scroll region
+//   • handle SIGWINCH
+//   • intercept X10 mouse events (scroll wheel) and PgUp/PgDn
+//   • pass everything else straight through to readline
+//
+// Populated by cmd_interactive() before calling rl.set_getc_function().
+
+struct ReplGetcState {
+    OutputQueue*              output_queue       = nullptr;
+    TUI*                      tui                = nullptr;
+    claudius::ScrollBuffer*   history            = nullptr;
+    int*                      scroll_offset      = nullptr;   // in VISUAL rows
+    int*                      new_while_scrolled = nullptr;   // in VISUAL rows
+    std::atomic<bool>*        quit_requested     = nullptr;
+    claudius::Orchestrator*   orch               = nullptr;
+    std::string*              multiline_accum    = nullptr;
+};
+static ReplGetcState g_getc_state;
+
+// Write `s` to stdout, turning every '\n' into "\r\n".  Readline puts the
+// terminal in raw output mode, so a bare LF moves the cursor down without
+// resetting the column — the next character then lands on the next row at
+// whatever column we left off at, which for content longer than the scroll
+// region spills straight into the input rows.  Emitting CRLF fixes it.
+static void fwrite_crlf(const std::string& s) {
+    size_t start = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\n') {
+            if (i > start) fwrite(s.data() + start, 1, i - start, stdout);
+            fputs("\r\n", stdout);
+            start = i + 1;
+        }
+    }
+    if (start < s.size()) fwrite(s.data() + start, 1, s.size() - start, stdout);
 }
-static int term_rows() {
-    struct winsize ws{};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
-        return ws.ws_row;
-    return 24;
+
+// Drain any pending exec output, record it in the scroll buffer, and render.
+// Uses ANSI save/restore so the cursor returns to where readline left it.
+// Takes TUI's tty mutex for the duration of any stdout write — pump thread,
+// exec thread, and main thread all reach stdout through here.
+static void getc_flush_output() {
+    auto& S = g_getc_state;
+    if (!S.output_queue || !S.history || !S.tui) return;
+    std::string pending = S.output_queue->drain();
+    if (pending.empty()) return;
+
+    int before = (*S.scroll_offset > 0) ? S.history->total_visual_rows() : 0;
+    S.history->push(pending);
+
+    std::lock_guard<std::recursive_mutex> lk(S.tui->tty_mutex());
+    if (*S.scroll_offset > 0) {
+        int after = S.history->total_visual_rows();
+        *S.new_while_scrolled += (after - before);
+        S.tui->render_scrollback(*S.history, *S.scroll_offset, *S.new_while_scrolled);
+    } else {
+        printf("\0337");
+        printf("\033[%d;1H", S.tui->last_scroll_row());
+        fwrite_crlf(pending);
+        printf("\0338");
+        fflush(stdout);
+    }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-class TUI {
-public:
-    // Layout — chrome rows anchored outside the scroll region.
-    // Rows 1-3: header
-    // Rows 4..N-3: scroll region (exec output here)
-    // Row N-2: separator
-    // Row N-1: readline prompt (fixed, outside scroll region)
-    // Row N:   status bar
-    static constexpr int kHeaderRows = 3;  // rows 1-3
-    static constexpr int kSepRows    = 1;  // row N-2
-    static constexpr int kInputRows  = 1;  // row N-1 (readline prompt)
-    static constexpr int kStatusRows = 1;  // row N   (status bar)
-
-    // Enter alternate screen, set scroll region, draw chrome.
-    void init(const std::string& agent, const std::string& model,
-              const std::string& color = "") {
-        (void)model;
-        cols_ = term_cols();
-        rows_ = term_rows();
-        current_agent_ = agent;
-        current_color_  = color;
-
-        printf("\033[?1049h");   // enter alternate screen
-        printf("\033[2J");       // clear
-        set_scroll_region();
-        fflush(stdout);
-        draw_header();
-        draw_sep();
-        erase_chrome_row(input_row());
-        erase_chrome_row(status_row());
-        // Park cursor at top of scroll region.
-        printf("\033[%d;1H", kHeaderRows + 1);
-        fflush(stdout);
-    }
-
-    void resize() {
-        cols_ = term_cols();
-        rows_ = term_rows();
-        printf("\033[2J");
-        set_scroll_region();
-        draw_header();
-        draw_sep();
-        erase_chrome_row(input_row());
-        erase_chrome_row(status_row());
-        fflush(stdout);
-    }
-
-    void shutdown() {
-        printf("\033[?1049l");   // exit alternate screen (restores original terminal)
-        fflush(stdout);
-    }
-
-    // Redraw header. stats_str comes from CostTracker::format_session_stats().
-    void update(const std::string& agent, const std::string& /*model*/,
-                const std::string& stats, const std::string& color = "") {
-        current_agent_ = agent;
-        current_stats_ = stats;
-        if (!color.empty()) current_color_ = color;
-        draw_header();
-    }
-
-    // Called before readline reads the next line.
-    // Ensures the cursor is on a fresh line inside the scroll region so the
-    // readline prompt is always visible and stable.
-    // Draw the fixed separator row (save/restore so the cursor doesn't move).
-    // Called on init, resize, and before each readline so it's always visible.
-    void draw_sep() {
-        printf("\0337");
-        printf("\033[%d;1H\033[38;5;237m", sep_row());
-        for (int i = 0; i < cols_; ++i) printf("─");
-        printf("\033[0m");
-        printf("\0338");
-        fflush(stdout);
-    }
-
-    // Called before readline callback install. Repaints the separator,
-    // moves cursor to the fixed input row (N-1), and updates status if needed.
-    void begin_input(int queued = 0) {
-        draw_sep();
-        printf("\033[%d;1H\033[2K", input_row());  // move to input row and clear it
-        fflush(stdout);
-        if (queued > 0) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%d queued", queued);
-            set_status(buf);
-            queue_indicator_shown_ = true;
-        }
-    }
-
-    std::string build_prompt() const {
-        // Just the colored ">"; cursor is already at input_row() from begin_input().
-        return "\001\033[38;5;241m\002>\001\033[0m\002 ";
-    }
-
-    // Last row of the scroll region (N-3): exec output is printed here.
-    int last_scroll_row() const { return rows_ - kSepRows - kInputRows - kStatusRows; }
-
-    // Spinner + message in the status bar.
-    void set_status(const std::string& msg) {
-        printf("\0337");
-        printf("\033[%d;1H\033[2K", status_row());  // erase line
-        printf("\033[38;5;240m   %.*s\033[0m",
-               cols_ - 3, msg.c_str());
-        printf("\0338");
-        fflush(stdout);
-        status_active_ = true;
-    }
-
-    void clear_status() {
-        if (!status_active_) return;
-        erase_chrome_row(status_row());
-        status_active_ = false;
-        queue_indicator_shown_ = false;
-    }
-
-    // Clear the queue indicator only — leaves ThinkingIndicator status alone.
-    void clear_queue_indicator() {
-        if (queue_indicator_shown_) clear_status();
-    }
-
-    int cols() const { return cols_; }
-
-    // Update the session title shown next to the agent name in the header.
-    // Thread-safe — called from the title-generation background thread.
-    void set_title(const std::string& title) {
-        std::lock_guard<std::mutex> lk(header_mu_);
-        session_title_ = title;
-        draw_header_locked();
-    }
-
-private:
-    int  cols_ = 80, rows_ = 24;
-    bool status_active_ = false;
-    std::atomic<bool> queue_indicator_shown_{false};
-    std::string current_agent_ = "claudius";
-    std::string current_stats_;   // from format_session_stats()
-    std::string current_color_;   // ANSI color for current agent name
-    std::string session_title_;   // generated after first response
-    mutable std::mutex header_mu_;
-
-    int sep_row()    const { return rows_ - kInputRows - kStatusRows; }  // N-2
-    int input_row()  const { return rows_ - kStatusRows; }               // N-1
-    int status_row() const { return rows_; }                              // N
-
-    void set_scroll_region() {
-        int top = kHeaderRows + 1;
-        int bot = rows_ - kSepRows - kInputRows - kStatusRows;  // N-3: content here
-        printf("\033[%d;%dr", top, bot);
-    }
-
-    // Erase a chrome row to a plain blank line (no background fill).
-    void erase_chrome_row(int row) {
-        printf("\0337");
-        printf("\033[%d;1H\033[2K\033[0m", row);
-        printf("\0338");
-        fflush(stdout);
-    }
-
-    void draw_header() {
-        std::lock_guard<std::mutex> lk(header_mu_);
-        draw_header_locked();
-    }
-
-    // Must be called with header_mu_ held.
-    void draw_header_locked() {
-        // Left side: "  agent  " or "  agent  ·  title  "
-        std::string left_vis = "  " + current_agent_;
-        if (!session_title_.empty())
-            left_vis += "   " + session_title_;
-        left_vis += "  ";
-
-        std::string right_vis = current_stats_.empty() ? "" : current_stats_ + "   ";
-        int pad = std::max(0, cols_ - (int)left_vis.size() - (int)right_vis.size());
-
-        printf("\0337");
-
-        // Row 1 — blank
-        printf("\033[1;1H\033[2K");
-
-        // Row 2 — agent name (bold, agent color) + optional title (dim) + stats (dim)
-        printf("\033[2;1H\033[2K");
-        if (!current_color_.empty()) printf("%s", current_color_.c_str());
-        printf("\033[1m  %s\033[0m", current_agent_.c_str());
-        if (!session_title_.empty())
-            printf("\033[2m   %s\033[0m", session_title_.c_str());
-        printf("  ");
-        printf("%*s", pad, "");
-        if (!right_vis.empty())
-            printf("\033[2m%s\033[0m", right_vis.c_str());
-
-        // Row 3 — dim separator
-        printf("\033[3;1H\033[2K\033[38;5;237m");
-        for (int i = 0; i < cols_; ++i) printf("─");
-        printf("\033[0m");
-
-        printf("\0338");
-        fflush(stdout);
-    }
-};
-
-// ─── Turn separator ───────────────────────────────────────────────────────────
-
-// Prints a colored rule line:  ─── label ──────────────────── right_label ─
-static void print_turn_rule(const std::string& label, const std::string& color,
-                             const std::string& right_label, int cols) {
-    const char* dim = "\033[38;5;238m";
-    const char* rst = "\033[0m";
-
-    // Visible widths: "─── " + label + " " + fill + right_label + " ─"
-    // but right_label may be empty.
-    int prefix = 4;  // "─── "
-    int suffix = right_label.empty() ? 0 : (int)right_label.size() + 2;  // " right ─" → +2
-    int label_w = (int)label.size() + 2;  // " label " padded on both sides
-    int fill = std::max(0, cols - prefix - label_w - suffix);
-
-    std::string line;
-    line += dim;
-    line += "───";
-    line += color;
-    line += " ";
-    line += label;
-    line += " ";
-    line += dim;
-    for (int i = 0; i < fill; ++i) line += "─";
-    if (!right_label.empty()) {
-        line += "\033[38;5;241m ";
-        line += right_label;
-        line += dim;
-        line += " ─";
-    }
-    line += rst;
-    line += "\n";
-    std::cout << line;
-}
-
-// ─── Title generation ────────────────────────────────────────────────────────
-
-// Fires a cheap Haiku call to produce a 5-7 word session title, then updates
-// the TUI header. Runs detached — does not block the caller.
-static void generate_title_async(claudius::ApiClient& client,
-                                  const std::string& user_msg,
-                                  const std::string& assistant_snippet,
-                                  TUI& tui) {
-    std::thread([&client, user_msg, assistant_snippet, &tui]() {
-        claudius::ApiRequest req;
-        req.model       = "claude-haiku-4-5-20251001";
-        req.max_tokens  = 12;
-        req.temperature = 0.3;
-        // No system_prompt — putting all instructions inline in the user turn
-        // avoids the model echoing the system prompt as its response.
-
-        std::string ctx = user_msg.substr(0, 200);
-        if (!assistant_snippet.empty())
-            ctx += "\n\n" + assistant_snippet.substr(0, 150);
-
-        // "Title:" at the end cues completion behavior rather than a reply.
-        req.messages = {{
-            "user",
-            "Conversation excerpt:\n" + ctx +
-            "\n\nWrite a 5-7 word task title for this conversation. "
-            "Reply with the title words only — no punctuation, no quotes.\n\nTitle:"
-        }};
-
-        auto resp = client.complete(req);
-        if (!resp.ok || resp.content.empty()) return;
-
-        std::string title = resp.content;
-        // Strip whitespace, punctuation, and any leading/trailing newlines.
-        while (!title.empty() && (title.back() == '\n' || title.back() == '\r' ||
-                                   title.back() == ' '  || title.back() == '.'))
-            title.pop_back();
-        while (!title.empty() && (title.front() == '\n' || title.front() == ' '))
-            title.erase(title.begin());
-        // Remove surrounding quotes if the model added them anyway.
-        if (title.size() >= 2 && title.front() == '"' && title.back() == '"')
-            title = title.substr(1, title.size() - 2);
-
-        if (!title.empty())
-            tui.set_title(title);
-    }).detach();
-}
-
-// ─── Thinking indicator ───────────────────────────────────────────────────────
-
-class ThinkingIndicator {
-public:
-    explicit ThinkingIndicator(TUI* tui = nullptr) : tui_(tui) {}
-
-    void start(const std::string& label = "thinking") {
-        label_ = label;
-        running_ = true;
-        thread_ = std::thread([this]() {
-            static const char* dots[] = {"", " .", " ..", " ..."};
-            int i = 0;
-            while (running_.load()) {
-                if (tui_) tui_->set_status(label_ + dots[i % 4]);
-                ++i;
-                std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            }
-            if (tui_) tui_->clear_status();
-        });
-    }
-
-    void stop() {
-        running_ = false;
-        if (thread_.joinable()) thread_.join();
-    }
-
-private:
-    TUI*             tui_ = nullptr;
-    std::string      label_;
-    std::atomic<bool> running_{false};
-    std::thread      thread_;
-};
-
-// Shared output lock: prevents loop thread output from interleaving with
-// interactive responses printed by the main thread.
-static std::mutex g_out_mu;
-
-// ─── Command queue ────────────────────────────────────────────────────────────
-// Decouples the readline loop from command execution so the user can type
-// the next command while the current one is still running.
-
-class CommandQueue {
-public:
-    void push(std::string cmd) {
-        std::lock_guard<std::mutex> lk(mu_);
-        items_.push(std::move(cmd));
-        cv_.notify_one();
-    }
-
-    // Blocks until an item is available or the queue is stopped.
-    // Returns false when stopped and empty.
-    bool pop(std::string& out) {
-        std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [this]{ return !items_.empty() || stopped_; });
-        if (items_.empty()) return false;
-        out = std::move(items_.front());
-        items_.pop();
-        return true;
-    }
-
-    void stop() {
-        std::lock_guard<std::mutex> lk(mu_);
-        stopped_ = true;
-        cv_.notify_all();
-    }
-
-    // Items waiting to execute (does NOT count the currently-executing item).
-    int pending() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        return static_cast<int>(items_.size());
-    }
-
-    // True while the exec thread is processing a command.
-    bool is_busy() const { return busy_.load(); }
-
-    void set_busy(bool b) { busy_ = b; }
-
-private:
-    mutable std::mutex      mu_;
-    std::condition_variable cv_;
-    std::queue<std::string> items_;
-    bool                    stopped_ = false;
-    std::atomic<bool>       busy_{false};
-};
-
-// ─── Output queue ─────────────────────────────────────────────────────────────
-// Only the main thread writes to stdout. The exec thread (and loop threads)
-// push formatted strings here; the main thread flushes in the select loop.
-
-class OutputQueue {
-public:
-    void push(const std::string& s) {
-        std::lock_guard<std::mutex> lk(mu_);
-        buf_ += s;
-    }
-    std::string drain() {
-        std::lock_guard<std::mutex> lk(mu_);
-        return std::move(buf_);
-    }
-private:
-    std::mutex  mu_;
-    std::string buf_;
-};
-
-// ─── Agent loop machinery ────────────────────────────────────────────────────
-
-enum class LoopState { Running, Suspended, Stopped };
-
-static const char* loop_state_str(LoopState s) {
-    switch (s) {
-        case LoopState::Running:   return "running";
-        case LoopState::Suspended: return "suspended";
-        case LoopState::Stopped:   return "stopped";
-    }
-    return "?";
-}
-
-struct LoopEntry {
-    std::string loop_id;
-    std::string agent_id;
-    LoopState   state   = LoopState::Running;
-    int         iter    = 0;
-    std::string last_output;
-    std::chrono::steady_clock::time_point started;
-
-    std::mutex              mu;
-    std::condition_variable cv;
-    std::queue<std::string> injected;
-    bool stop_req    = false;
-    bool suspend_req = false;
-
-    // Buffered output — loop runs silently; pull via /log <id>
-    std::vector<std::string> output_log;
-
-    // Terminal-visible error message set when loop exits abnormally
-    std::string stop_reason;
-
-    // Optional cost tracker for per-loop cost accounting
-    claudius::CostTracker* tracker = nullptr;
-
-    // Output queue: loop threads push here instead of writing stdout directly
-    OutputQueue* oq = nullptr;
-
-    std::thread thread;
-
-    LoopEntry() = default;
-    LoopEntry(const LoopEntry&) = delete;
-    LoopEntry& operator=(const LoopEntry&) = delete;
-};
-
-class LoopManager {
-public:
-    ~LoopManager() {
-        std::unique_lock<std::mutex> lk(mu_);
-        for (auto& [id, e] : loops_) {
-            std::lock_guard<std::mutex> ek(e->mu);
-            e->stop_req = true;
-            e->cv.notify_all();
-        }
-        // Collect threads to join outside the lock
-        std::vector<std::thread*> threads;
-        for (auto& [id, e] : loops_) threads.push_back(&e->thread);
-        lk.unlock();
-        for (auto* t : threads) if (t->joinable()) t->join();
-    }
-
-    // Start a new loop; returns the loop ID.
-    std::string start(claudius::Orchestrator& orch,
-                      const std::string& agent_id,
-                      const std::string& initial_prompt,
-                      claudius::CostTracker* tracker = nullptr,
-                      OutputQueue* oq = nullptr) {
-        std::lock_guard<std::mutex> lk(mu_);
-        std::string lid = "loop-" + std::to_string(next_id_++);
-        auto e = std::make_unique<LoopEntry>();
-        e->loop_id  = lid;
-        e->agent_id = agent_id;
-        e->started  = std::chrono::steady_clock::now();
-        e->state    = LoopState::Running;
-        e->tracker  = tracker;
-        e->oq       = oq;
-        e->thread   = std::thread(run_loop, e.get(), std::ref(orch), initial_prompt);
-        loops_[lid] = std::move(e);
-        return lid;
-    }
-
-    bool kill(const std::string& lid) {
-        std::unique_lock<std::mutex> lk(mu_);
-        auto it = loops_.find(lid);
-        if (it == loops_.end()) return false;
-        auto* e = it->second.get();
-        { std::lock_guard<std::mutex> ek(e->mu); e->stop_req = true; }
-        e->cv.notify_all();
-        auto& t = e->thread;
-        lk.unlock();
-        if (t.joinable()) t.join();
-        lk.lock();
-        loops_.erase(lid);
-        return true;
-    }
-
-    bool suspend(const std::string& lid) {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = loops_.find(lid);
-        if (it == loops_.end()) return false;
-        if (it->second->state != LoopState::Running) return false;
-        { std::lock_guard<std::mutex> ek(it->second->mu); it->second->suspend_req = true; }
-        it->second->state = LoopState::Suspended;
-        return true;
-    }
-
-    bool resume(const std::string& lid) {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = loops_.find(lid);
-        if (it == loops_.end()) return false;
-        if (it->second->state != LoopState::Suspended) return false;
-        { std::lock_guard<std::mutex> ek(it->second->mu); it->second->suspend_req = false; }
-        it->second->state = LoopState::Running;
-        it->second->cv.notify_all();
-        return true;
-    }
-
-    bool inject(const std::string& lid, const std::string& msg) {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = loops_.find(lid);
-        if (it == loops_.end()) return false;
-        { std::lock_guard<std::mutex> ek(it->second->mu); it->second->injected.push(msg); }
-        it->second->cv.notify_all();
-        return true;
-    }
-
-    std::string list() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (loops_.empty()) return "  (no active loops)\n";
-        std::ostringstream ss;
-        auto now = std::chrono::steady_clock::now();
-        for (auto& [lid, e] : loops_) {
-            long secs = std::chrono::duration_cast<std::chrono::seconds>(
-                now - e->started).count();
-            ss << "  " << lid
-               << "  agent:" << e->agent_id
-               << "  state:" << loop_state_str(e->state)
-               << "  iter:" << e->iter
-               << "  elapsed:" << secs << "s\n";
-            if (e->state == LoopState::Stopped && !e->stop_reason.empty()) {
-                ss << "    stop: " << e->stop_reason << "\n";
-            } else if (!e->last_output.empty()) {
-                // Show truncated last output as preview
-                std::string preview = e->last_output.substr(
-                    0, std::min<size_t>(120, e->last_output.size()));
-                // Replace newlines with spaces for single-line preview
-                for (char& c : preview) if (c == '\n') c = ' ';
-                ss << "    last: " << preview;
-                if (e->last_output.size() > 120) ss << "...";
-                ss << "\n";
-            }
-        }
-        return ss.str();
-    }
-
-    // Return buffered log for a loop. N=0 means all.
-    std::string log(const std::string& lid, int last_n = 0) const {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = loops_.find(lid);
-        if (it == loops_.end()) return "ERR: no loop '" + lid + "'\n";
-        const auto& entries = it->second->output_log;
-        if (entries.empty()) return "  (no output yet)\n";
-
-        std::ostringstream ss;
-        int start = 0;
-        if (last_n > 0 && static_cast<int>(entries.size()) > last_n)
-            start = static_cast<int>(entries.size()) - last_n;
-        for (int i = start; i < static_cast<int>(entries.size()); ++i)
-            ss << entries[i];
-        return ss.str();
-    }
-
-    // Number of log entries (for tail-detection in /watch)
-    size_t log_count(const std::string& lid) const {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = loops_.find(lid);
-        if (it == loops_.end()) return 0;
-        return it->second->output_log.size();
-    }
-
-    // Return log entries starting at offset (for streaming new entries)
-    std::string log_since(const std::string& lid, size_t offset) const {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = loops_.find(lid);
-        if (it == loops_.end()) return "";
-        const auto& entries = it->second->output_log;
-        std::ostringstream ss;
-        for (size_t i = offset; i < entries.size(); ++i)
-            ss << entries[i];
-        return ss.str();
-    }
-
-    // True if the loop is stopped or no longer exists
-    bool is_stopped(const std::string& lid) const {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = loops_.find(lid);
-        if (it == loops_.end()) return true;
-        return it->second->state == LoopState::Stopped;
-    }
-
-    // Reap any loops whose threads have finished
-    void reap_stopped() {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (auto it = loops_.begin(); it != loops_.end(); ) {
-            if (it->second->state == LoopState::Stopped) {
-                if (it->second->thread.joinable()) it->second->thread.join();
-                it = loops_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    // Return all loop IDs (for tab completion)
-    std::vector<std::string> list_ids() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        std::vector<std::string> ids;
-        for (auto& [lid, _] : loops_) ids.push_back(lid);
-        return ids;
-    }
-
-    bool has_active() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (auto& [_, e] : loops_)
-            if (e->state != LoopState::Stopped) return true;
-        return false;
-    }
-
-    int active_count() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        int n = 0;
-        for (auto& [_, e] : loops_)
-            if (e->state != LoopState::Stopped) ++n;
-        return n;
-    }
-
-private:
-    static void run_loop(LoopEntry* e, claudius::Orchestrator& orch,
-                         std::string initial_prompt) {
-        // First iteration uses the initial prompt.
-        // Subsequent iterations send "Continue." — the agent already has its
-        // prior output in conversation history, so feeding the raw output back
-        // as a user message would make it appear to be echoed by a human.
-        std::string prompt = initial_prompt;
-        bool first = true;
-        bool stopped_by_request = false;
-        int  consecutive_idle = 0;         // iterations with no tool calls
-        int  total_iters      = 0;
-        static constexpr int kMaxIdle  = 2;   // stop after this many consecutive idle turns
-        static constexpr int kMaxIters = 20;  // hard ceiling
-
-        while (true) {
-            // Enforce hard iteration ceiling
-            if (total_iters >= kMaxIters) {
-                e->stop_reason = "max iterations reached (" + std::to_string(kMaxIters) + ")";
-                if (e->oq) {
-                    e->oq->push("\n\033[33m[" + e->loop_id + "/" + e->agent_id +
-                                " MAX ITERS]\033[0m " + e->stop_reason +
-                                "\n  Use /log " + e->loop_id + " to review.\n");
-                }
-                break;
-            }
-
-            // Wait out any suspension (or stop)
-            {
-                std::unique_lock<std::mutex> lk(e->mu);
-                e->cv.wait(lk, [e]{ return !e->suspend_req || e->stop_req; });
-                if (e->stop_req) { stopped_by_request = true; break; }
-                // Injected prompt resets the idle counter and resumes active work
-                if (!e->injected.empty()) {
-                    prompt = e->injected.front();
-                    e->injected.pop();
-                    first = true;
-                    consecutive_idle = 0;
-                }
-            }
-
-            // Log that this iteration is starting (visible via /watch before the API call returns)
-            {
-                std::ostringstream pre;
-                pre << "[" << e->loop_id << "/" << e->agent_id
-                    << " thinking...]\n";
-                std::lock_guard<std::mutex> ek(e->mu);
-                e->output_log.push_back(pre.str());
-            }
-
-            auto resp = orch.send(e->agent_id, prompt);
-            e->iter++;
-            total_iters++;
-
-            // Track idle iterations (no tool calls = agent has nothing active to do)
-            if (resp.ok) {
-                if (resp.had_tool_calls) {
-                    consecutive_idle = 0;
-                } else {
-                    consecutive_idle++;
-                }
-            }
-
-            // Replace the "thinking..." placeholder with the real result
-            {
-                std::ostringstream entry;
-                entry << "[" << e->loop_id << "/" << e->agent_id
-                      << " #" << e->iter << "]\n";
-                if (resp.ok) {
-                    entry << claudius::render_markdown(resp.content) << "\n";
-                    if (e->tracker) {
-                        std::string model = orch.get_agent_model(e->agent_id);
-                        e->tracker->record(e->agent_id, model, resp);
-                        entry << "  " << e->tracker->format_footer(resp, model) << "\n";
-                    } else {
-                        entry << "  [in:" << resp.input_tokens
-                              << " out:" << resp.output_tokens << "]\n";
-                    }
-                    e->last_output = resp.content;
-                } else {
-                    entry << "ERR: " << resp.error << "\n";
-                }
-                std::lock_guard<std::mutex> ek(e->mu);
-                // Replace the last entry (the "thinking..." placeholder)
-                if (!e->output_log.empty()) {
-                    e->output_log.back() = entry.str();
-                } else {
-                    e->output_log.push_back(entry.str());
-                }
-            }
-
-            if (!resp.ok) {
-                e->stop_reason = resp.error;
-                // Notify the user immediately — loop died
-                if (e->oq) {
-                    e->oq->push("\n\033[1;31m[" + e->loop_id + "/" +
-                                e->agent_id + " FAILED]\033[0m " +
-                                resp.error +
-                                "\n  Use /log " + e->loop_id +
-                                " to see output, /kill " + e->loop_id +
-                                " to dismiss.\n");
-                }
-                break;
-            }
-
-            // Auto-stop: agent has nothing left to do (no tool calls for N turns)
-            if (consecutive_idle >= kMaxIdle) {
-                e->stop_reason = "task complete (idle after " +
-                                 std::to_string(consecutive_idle) + " turns)";
-                if (e->oq) {
-                    e->oq->push("\n\033[1;32m[" + e->loop_id + "/" +
-                                e->agent_id + " DONE]\033[0m " +
-                                e->stop_reason +
-                                "\n  Use /log " + e->loop_id +
-                                " to review, /kill " + e->loop_id + " to dismiss.\n");
-                }
-                break;
-            }
-
-            // Don't feed output back as prompt — that causes the agent to
-            // believe its own text is being echoed by a human, producing
-            // infinite confusion. History already carries the prior response.
-            if (first) {
-                first = false;
-            }
-            prompt = "Continue.";
-
-            // Re-check stop before sleeping
-            { std::lock_guard<std::mutex> lk(e->mu); if (e->stop_req) { stopped_by_request = true; break; } }
-
-            // Brief pause between iterations to avoid hammering the API
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-        }
-
-        e->state = LoopState::Stopped;
-    }
-
-    mutable std::mutex mu_;
-    std::map<std::string, std::unique_ptr<LoopEntry>> loops_;
-    int next_id_ = 0;
-};
 
 static void cmd_interactive() {
     std::string dir = get_config_dir();
@@ -1228,49 +147,90 @@ static void cmd_interactive() {
     TUI tui;
     tui.init(current_agent, current_model, agent_color(current_agent));
 
-    // Restore previous session if one exists.
-    std::string session_path = dir + "/session.json";
+    // Session files are scoped to the working directory so that starting
+    // claudius in different repos doesn't bleed history across contexts.
+    // We hash the cwd to produce a short, filesystem-safe filename.
+    auto cwd_session_key = []() -> std::string {
+        std::string cwd = fs::current_path().string();
+        // FNV-1a 32-bit hash
+        uint32_t h = 2166136261u;
+        for (unsigned char c : cwd) { h ^= c; h *= 16777619u; }
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%08x", h);
+        return buf;
+    };
+    std::string sessions_dir = dir + "/sessions";
+    fs::create_directories(sessions_dir);
+    std::string session_path = sessions_dir + "/" + cwd_session_key() + ".json";
     bool restored = orch.load_session(session_path);
 
     std::cout << "\n";
     if (restored)
-        std::cout << "  \033[2mSession restored.\033[0m\n\n";
+        std::cout << "\033[2mSession restored.\033[0m\n\n";
     else
-        std::cout << "  /help for commands\n\n";
+        std::cout << "/help for commands\n\n";
     std::cout.flush();
 
     signal(SIGWINCH, sigwinch_handler);
 
-    // Wire sub-agent progress: print each sub-agent turn dimmed and indented.
-    // Called from within the locked send_streaming path — do NOT re-acquire g_out_mu.
-    orch.set_progress_callback([&tui](const std::string& agent_id,
-                                      const std::string& content) {
-        // Sub-agent rule: same style as turn rules but dimmer (no agent palette color).
+    // Output queue: exec and loop threads push here; main thread flushes
+    // (with CRLF expansion) via getc_flush_output.  Defined ahead of the
+    // progress callback so that callback can route through it instead of
+    // writing to stdout directly — direct writes would skip the CRLF fix.
+    OutputQueue output_queue;
+
+    // Wire sub-agent progress: enqueue each sub-agent turn dimmed and indented.
+    orch.set_progress_callback([&tui, &output_queue](const std::string& agent_id,
+                                                     const std::string& content) {
         const char* dim_rule = "\033[38;5;238m";
         const char* rst      = "\033[0m";
         int cols = tui.cols();
 
-        // ─── agent_id (sub) ────────────────────────────────────
         std::string label = agent_id + " (sub)";
         int fill = std::max(0, cols - 4 - (int)label.size() - 2);
         std::string rule = std::string(dim_rule) + "── " + label + " ";
         for (int i = 0; i < fill; ++i) rule += "─";
         rule += rst;
-        std::cout << "\n" << rule << "\n";
 
-        // Content: dimmed, each line indented
+        std::string buf;
+        buf += "\n" + rule + "\n";
         std::istringstream ss(content);
-        std::string line;
-        while (std::getline(ss, line)) {
-            std::cout << dim_rule << "  " << line << rst << "\n";
+        std::string ln;
+        while (std::getline(ss, ln)) {
+            buf += dim_rule;
+            buf += "  ";
+            buf += ln;
+            buf += rst;
+            buf += "\n";
         }
-        std::cout.flush();
+        output_queue.push(buf);
     });
 
     ThinkingIndicator thinking(&tui);
     LoopManager loops;
-    claudius::ReadlineWrapper rl;
     claudius::CostTracker tracker;
+
+    // ── Raw stdin ──────────────────────────────────────────────────────────
+    // Our filter thread (below) owns stdin and reads byte-by-byte.  libedit's
+    // own terminal setup happens on the PTY slave, not on stdin, so its
+    // tcsetattr will not clobber these settings.
+    struct termios orig_stdin_tm;
+    bool stdin_is_tty = (::tcgetattr(STDIN_FILENO, &orig_stdin_tm) == 0);
+    if (stdin_is_tty) {
+        struct termios raw = orig_stdin_tm;
+        raw.c_lflag &= ~(ICANON | ECHO | ISIG | IEXTEN);
+        raw.c_iflag &= ~(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
+        raw.c_cc[VMIN]  = 1;
+        raw.c_cc[VTIME] = 0;
+        ::tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    }
+
+    // ── Line editor ────────────────────────────────────────────────────────
+    // We read and echo input ourselves — see include/tui/line_editor.h for
+    // why libedit is no longer in the interactive path.  ReadlineWrapper
+    // still owns history file I/O though, and we'll hand its contents to
+    // the editor below after they're loaded.
+    claudius::LineEditor editor(tui);
 
     // Record sub-agent token costs that bypass the top-level REPL handler.
     orch.set_cost_callback([&tracker](const std::string& agent_id,
@@ -1284,11 +244,17 @@ static void cmd_interactive() {
         tui.set_status(agent_id + ": thinking...");
     });
 
-    rl.set_max_history(1000);
-    rl.load_history(get_config_dir() + "/history");
+    editor.set_max_history(1000);
+    {
+        std::ifstream hf(get_config_dir() + "/history");
+        std::vector<std::string> loaded;
+        std::string line;
+        while (std::getline(hf, line)) if (!line.empty()) loaded.push_back(std::move(line));
+        editor.set_history(std::move(loaded));
+    }
 
     // Tab completion: slash commands, agent names, loop IDs
-    rl.set_completion_provider(
+    editor.set_completion_provider(
         [&orch, &loops](const std::string& buf, const std::string& tok)
         -> std::vector<std::string> {
             auto match = [&](const std::vector<std::string>& candidates) {
@@ -1347,11 +313,9 @@ static void cmd_interactive() {
     auto maybe_generate_title = [&](const std::string& user_msg,
                                      const std::string& response_snippet) {
         if (title_generated.exchange(true)) return;  // already done
-        generate_title_async(orch.client(), user_msg, response_snippet, tui);
+        claudius::generate_title_async(orch.client(), user_msg, response_snippet,
+            [&tui](const std::string& t){ tui.set_title(t); });
     };
-
-    // Output queue: exec and loop threads push here; main thread flushes.
-    OutputQueue output_queue;
 
     // All command handling lives in this lambda, called from the exec thread.
     // ALL output goes through output_queue.push() — never directly to stdout.
@@ -1859,50 +823,105 @@ static void cmd_interactive() {
     });
 
     // ── Main readline loop ──────────────────────────────────────────────────
-    bool exit_warned = false;
-    while (!quit_requested) {
-        if (g_winch) { g_winch = 0; tui.resize(); }
+    bool        exit_warned    = false;
+    std::string multiline_accum;           // accumulated prefix from backslash continuation
 
+    // Scroll history back-buffer: bounded, visual-row-aware.  PgUp/PgDn and
+    // the mouse wheel adjust scroll_offset (in VISUAL rows); offset=0 is live.
+    claudius::ScrollBuffer history;
+    history.set_cols(tui.cols());
+    int scroll_offset      = 0;   // visual rows above the tail (0 = live view)
+    int new_while_scrolled = 0;   // visual rows accumulated while scrolled back
+
+    // ── Wire filtered_getc as readline's character source ──────────────────
+    // All input classification (mouse, scroll, ESC interrupt, output draining,
+    // ── State exposed to getc_flush_output (called by the pump thread) ────
+    g_getc_state.output_queue       = &output_queue;
+    g_getc_state.tui                = &tui;
+    g_getc_state.history            = &history;
+    g_getc_state.scroll_offset      = &scroll_offset;
+    g_getc_state.new_while_scrolled = &new_while_scrolled;
+    g_getc_state.quit_requested     = &quit_requested;
+    g_getc_state.orch               = &orch;
+    g_getc_state.multiline_accum    = &multiline_accum;
+
+    // ── Scroll/cancel handlers for the line editor ─────────────────────────
+    // The editor reads stdin itself; when it sees a mouse-wheel or PgUp/PgDn
+    // event it defers the actual scrollback update to us via these callbacks.
+    auto apply_scroll = [&](int direction, int step) {
+        int max_off = history.total_visual_rows();
+        if (direction < 0) {
+            scroll_offset = std::min(scroll_offset + step, max_off);
+        } else {
+            scroll_offset = std::max(0, scroll_offset - step);
+            new_while_scrolled = 0;
+            if (scroll_offset == 0) tui.clear_status();
+        }
+        tui.render_scrollback(history, scroll_offset, new_while_scrolled);
+    };
+    editor.set_scroll_handler(apply_scroll);
+    editor.set_cancel_handler([&]() {
+        orch.cancel();
+        multiline_accum.clear();
+        output_queue.push("\033[38;5;167m[interrupted]\033[0m\n");
+    });
+
+    // ── Output pump ────────────────────────────────────────────────────────
+    // libedit's blocking readline() on macOS does NOT route through
+    // rl_getc_function — it reads el_infile directly via its internal
+    // read_char — so we cannot rely on filtered_getc running during idle to
+    // flush output_queue to the scroll region.  Instead, a dedicated pump
+    // thread ticks every 30 ms and drains the queue.  It shares tui.tty_mutex
+    // with the echo path and exec-thread TUI updates so concurrent writes to
+    // stdout don't tear each other's ANSI save/restore pairs.
+    std::atomic<bool> pump_stop{false};
+    std::thread output_pump([&]() {
+        while (!pump_stop.load()) {
+            // Handle SIGWINCH — our line editor runs on the main thread, so
+            // we only need to redraw the TUI chrome and reflow the scroll
+            // buffer's wrap cache here.  The editor picks up the new width
+            // on the next redraw through tui.cols().
+            if (g_winch) {
+                g_winch = 0;
+                tui.resize();
+                history.set_cols(tui.cols());
+            }
+            getc_flush_output();
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+        getc_flush_output();   // final drain on shutdown
+    });
+
+    while (!quit_requested) {
         tui.begin_input(cmd_queue.pending());
 
-        // Install readline callback at the current cursor position (N-1).
-        std::atomic<bool> line_ready{false};
-        std::string completed_line;
+        // Continuation prompt ("…") when accumulating a multi-line input.
+        std::string prompt = multiline_accum.empty()
+            ? tui.build_prompt()
+            : "\001\033[38;5;241m\002…\001\033[0m\002 ";
 
-        rl.install_callback(tui.build_prompt(), [&](const std::string& line) {
-            completed_line = line;
-            line_ready = true;
-        });
-
-        // Select loop: flush exec output + process readline input
-        while (!line_ready && !quit_requested) {
-            if (g_winch) { g_winch = 0; tui.resize(); }
-
-            // Flush pending exec output (main thread owns stdout)
-            std::string pending = output_queue.drain();
-            if (!pending.empty()) {
-                printf("\0337");                                         // save cursor (at N-1)
-                printf("\033[%d;1H", tui.last_scroll_row());            // move to N-3
-                fwrite(pending.data(), 1, pending.size(), stdout);
-                printf("\0338");                                         // restore cursor to N-1
-                fflush(stdout);
-            }
-
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(STDIN_FILENO, &rfds);
-            struct timeval tv = {0, 20000};  // 20ms
-            select(STDIN_FILENO + 1, &rfds, nullptr, nullptr, &tv);
-
-            if (FD_ISSET(STDIN_FILENO, &rfds)) {
-                rl.process_char();
-            }
-        }
-
-        rl.remove_callback();
+        // LineEditor owns stdin while reading.  Mouse / page-scroll events
+        // are dispatched to our scroll handler and don't return from here;
+        // Enter returns with the full line, Ctrl-D on an empty buffer
+        // returns false (treated as EOF below).
+        std::string line;
+        if (!editor.read_line(prompt, line)) break;
         if (quit_requested) break;
+        if (!line.empty()) editor.add_to_history(line);
 
-        std::string line = completed_line;
+        // Return to live view whenever the user submits input.
+        scroll_offset      = 0;
+        new_while_scrolled = 0;
+
+        // ── Backslash-continuation: "\" at end-of-line accumulates and
+        //    re-prompts with "…" until a line arrives without trailing "\".
+        if (!line.empty() && line.back() == '\\') {
+            multiline_accum += line.substr(0, line.size() - 1) + "\n";
+            continue;
+        }
+        line = multiline_accum + line;
+        multiline_accum.clear();
+
         if (line.empty()) continue;
 
         // Exit check
@@ -1942,11 +961,15 @@ static void cmd_interactive() {
             }
 
             std::string echo = "\033[38;5;244m> \033[38;5;250m" + line + "\033[0m\n\n";
-            printf("\0337");
-            printf("\033[%d;1H", tui.last_scroll_row());
-            fwrite(echo.data(), 1, echo.size(), stdout);
-            printf("\0338");
-            fflush(stdout);
+            history.push(echo);
+            {
+                std::lock_guard<std::recursive_mutex> lk(tui.tty_mutex());
+                printf("\0337");
+                printf("\033[%d;1H", tui.last_scroll_row());
+                fwrite_crlf(echo);
+                printf("\0338");
+                fflush(stdout);
+            }
         }
 
         bool was_busy = cmd_queue.is_busy();
@@ -1959,8 +982,19 @@ static void cmd_interactive() {
     cmd_queue.stop();
     exec_thread.join();
 
-    // Save session before restoring terminal.
-    rl.save_history(get_config_dir() + "/history");
+    // Stop the output pump after the exec thread has drained — that way any
+    // final output it pushed still gets rendered before we restore the screen.
+    pump_stop = true;
+    output_pump.join();
+
+    // Restore stdin to its original termios.
+    if (stdin_is_tty) ::tcsetattr(STDIN_FILENO, TCSANOW, &orig_stdin_tm);
+
+    // Persist history (the editor holds the authoritative list now).
+    {
+        std::ofstream hf(get_config_dir() + "/history");
+        for (auto& h : editor.history()) hf << h << '\n';
+    }
     orch.save_session(session_path);
 
     // Restore terminal and print session summary.
@@ -1968,22 +1002,6 @@ static void cmd_interactive() {
     std::cout << "\n";
     if (tracker.session_cost() > 0.0) {
         std::cout << tracker.format_summary();
-    }
-}
-
-static void cmd_oneshot(const std::string& agent_id, const std::string& msg) {
-    std::string dir = get_config_dir();
-    std::string api_key = get_api_key();
-
-    claudius::Orchestrator orch(api_key);
-    orch.load_agents(dir + "/agents");
-
-    auto resp = orch.send(agent_id, msg);
-    if (resp.ok) {
-        std::cout << resp.content << "\n";
-    } else {
-        std::cerr << "ERR: " << resp.error << "\n";
-        std::exit(1);
     }
 }
 
@@ -1997,11 +1015,11 @@ int main(int argc, char* argv[]) {
         std::string arg1 = argv[1];
 
         if (arg1 == "--init" || arg1 == "init") {
-            cmd_init();
+            claudius::cmd_init();
             return 0;
         }
         if (arg1 == "--gen-token" || arg1 == "gen-token") {
-            cmd_gen_token();
+            claudius::cmd_gen_token();
             return 0;
         }
         if (arg1 == "--serve" || arg1 == "serve") {
@@ -2009,7 +1027,7 @@ int main(int argc, char* argv[]) {
             if (argc >= 4 && std::string(argv[2]) == "--port") {
                 port = std::atoi(argv[3]);
             }
-            cmd_serve(port);
+            claudius::cmd_serve(port);
             return 0;
         }
         if (arg1 == "--send" || arg1 == "send") {
@@ -2023,7 +1041,7 @@ int main(int argc, char* argv[]) {
                 if (i > 3) msg += " ";
                 msg += argv[i];
             }
-            cmd_oneshot(agent, msg);
+            claudius::cmd_oneshot(agent, msg);
             return 0;
         }
         if (arg1 == "--help" || arg1 == "-h" || arg1 == "help") {

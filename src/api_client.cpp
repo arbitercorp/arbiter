@@ -90,6 +90,16 @@ bool ApiClient::ensure_connection() {
     return true;
 }
 
+void ApiClient::cancel() {
+    cancelled_.store(true);
+    // Shut down the socket so any blocking SSL_read returns immediately.
+    // We use shutdown() rather than close() to avoid a race with the thread
+    // that owns the fd — the streaming loop will call close_connection() on
+    // its own after seeing the error.
+    std::lock_guard<std::mutex> lk(conn_mutex_);
+    if (sock_ >= 0) ::shutdown(sock_, SHUT_RDWR);
+}
+
 void ApiClient::close_connection() {
     if (ssl_) {
         SSL_shutdown(ssl_);
@@ -474,12 +484,12 @@ ApiResponse ApiClient::read_streaming_response(StreamCallback cb) {
     };
 
     if (chunked) {
-        while (true) {
+        while (!cancelled_.load()) {
             // Read chunk size line
             std::string size_line;
             while (true) {
                 int n = SSL_read(ssl_, buf, 1);
-                if (n <= 0) goto stream_done;
+                if (n <= 0 || cancelled_.load()) goto stream_done;
                 if (buf[0] == '\n') break;
                 if (buf[0] != '\r') size_line += buf[0];
             }
@@ -488,6 +498,7 @@ ApiResponse ApiClient::read_streaming_response(StreamCallback cb) {
 
             int read_so_far = 0;
             while (read_so_far < chunk_size) {
+                if (cancelled_.load()) goto stream_done;
                 int to_read = std::min(chunk_size - read_so_far, (int)sizeof(buf));
                 int n = SSL_read(ssl_, buf, to_read);
                 if (n <= 0) goto stream_done;
@@ -496,14 +507,14 @@ ApiResponse ApiClient::read_streaming_response(StreamCallback cb) {
             }
             SSL_read(ssl_, buf, 2);  // trailing \r\n
         }
-        SSL_read(ssl_, buf, 2);  // final \r\n
+        if (!cancelled_.load()) SSL_read(ssl_, buf, 2);  // final \r\n
     } else {
         int content_length = -1;
         auto cl_pos = headers.find("Content-Length: ");
         if (cl_pos != std::string::npos)
             content_length = std::atoi(headers.c_str() + cl_pos + 16);
         int read_so_far = 0;
-        while (content_length < 0 || read_so_far < content_length) {
+        while ((content_length < 0 || read_so_far < content_length) && !cancelled_.load()) {
             int n = SSL_read(ssl_, buf, sizeof(buf));
             if (n <= 0) break;
             feed(buf, n);
@@ -518,6 +529,7 @@ stream_done:
 }
 
 ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
+    cancelled_.store(false);  // clear any prior interrupt before starting
     static const int kMaxAttempts = 3;
 
     for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
